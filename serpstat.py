@@ -16,7 +16,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urlparse, urljoin
 from typing import List, Dict, Tuple, Optional, Any, Set
 from bs4 import BeautifulSoup
-from pymystem3 import Mystem
+import pymorphy3
 import Stemmer
 from rapidfuzz import fuzz
 import html
@@ -68,12 +68,8 @@ DEFAULT_STEM_FUZZY_RATIO_THRESHOLD = 90
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 RUSSIAN_STEMMER = Stemmer.Stemmer('russian')
 RAPIDFUZZ_AVAILABLE = True
+morph = pymorphy3.MorphAnalyzer()
 
-@st.cache_resource
-def get_mystem_instance():
-    print("Инициализация Mystem...")
-    return Mystem()
-morph = get_mystem_instance()
 
 session = requests.Session()
 retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
