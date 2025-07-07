@@ -1,0 +1,13 @@
+streamlit
+pandas
+requests
+beautifulsoup4
+lxml
+openpyxl
+pymorphy3
+python-docx
+python-dotenv
+urllib3
+pystemmer
+rapidfuzz
+aiohttp
