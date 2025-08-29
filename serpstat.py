@@ -23,6 +23,7 @@ import html
 import traceback
 import asyncio
 import aiohttp
+import time
 
 # =================== НАСТРОЙКИ ===================
 load_dotenv()
@@ -165,17 +166,29 @@ def analyze_texts(text1: str, text2: str) -> str:
 
 # ========== НОВАЯ ВКЛАДКА: SEO Meta Checker ==========
 def normalize_for_search(text: Optional[Any]) -> str:
-    if not text: return ""
-    text_str = str(text).lower()
-    text_str = re.sub(r'(цена от|ціна від|price from)\s*[^-\|\n\r<]+?(\s*[-\|]|$)', ' ', text_str, flags=re.IGNORECASE)
-    text_str = re.sub(r'%[a-z_]+price[a-z_]*%', ' ', text_str)
-    text_str = re.sub(r'%[a-z_]+%', ' ', text_str)
-    text_str = re.sub(r'\d+(\.\d+)?\s*(грн|uah|usd|eur)?', ' ', text_str)
-    text_str = re.sub(r'[/\\|\-–—]', ' ', text_str)
-    text_str = re.sub(r'[\s\u00a0\u200b]+', ' ', text_str)
-    text_str = re.sub(r'[^\w\s]', '', text_str, flags=re.UNICODE)
-    text_str = re.sub(r'\s+', ' ', text_str)
-    return text_str.strip()
+    """Улучшенная нормализация текста для поиска"""
+    if not text or pd.isna(text):
+        return ""
+    
+    # Приводим к строке и нижнему регистру
+    text = str(text).lower().strip()
+    
+    # Удаляем HTML-теги
+    text = re.sub(r'<[^>]+>', ' ', text)
+    
+    # Удаляем цены и другие числовые значения
+    text = re.sub(r'(цена от|ціна від|price from)\s*[^-\|\n\r<–—]+?(\s*[-\|–—]|$)', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(от|від)\s*[^-\|\n\r<–—]+?(\s*[-\|–—]|$)', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'%\s*[^%]+?\s*%', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\d+(\.\d+)?\s*(грн|uah|usd|eur|₴)?', ' ', text, flags=re.IGNORECASE)
+    
+    # Заменяем все не-буквенные символы на пробелы
+    text = re.sub(r'[^a-zа-яё0-9\s]', ' ', text, flags=re.IGNORECASE)
+    
+    # Заменяем множественные пробелы на один
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
 
 def split_phrases(phrases_text: Optional[Any]) -> List[str]:
     if not phrases_text or (isinstance(phrases_text, float) and pd.isna(phrases_text)) or not str(phrases_text).strip():
@@ -187,15 +200,16 @@ def split_phrases(phrases_text: Optional[Any]) -> List[str]:
 def cached_lemmatize_word_flexibly(word_to_lemmatize: str, debug_mode_for_messages: bool = False) -> Set[str]:
     clean_word = word_to_lemmatize.strip().lower()
     if not clean_word: return set()
-    analyses = morph.analyze(clean_word)
     possible_lemmas = set()
-    for analysis_item in analyses:
-        if analysis_item.get('analysis') and analysis_item['analysis']:
-            lemma = analysis_item['analysis'][0]['lex'].lower()
-            if lemma.strip().isalnum(): possible_lemmas.add(lemma)
-        elif not possible_lemmas and 'text' in analysis_item:
-            original_form = analysis_item['text'].lower()
-            if original_form.strip().isalnum(): possible_lemmas.add(original_form)
+    parsed_words = morph.parse(clean_word)
+    for parsed_word in parsed_words:
+        # Get normal form (lemma) of the word
+        lemma = parsed_word.normal_form.lower()
+        if lemma.strip().isalnum():
+            possible_lemmas.add(lemma)
+    # If no lemmas found, try adding the original word
+    if not possible_lemmas and clean_word.strip().isalnum():
+        possible_lemmas.add(clean_word)
     if debug_mode_for_messages and not possible_lemmas and clean_word:
         if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
         debug_msg_detail = f"Анализ Mystem: {str(analyses)[:100]}..." if analyses else "Нет анализа"
@@ -204,8 +218,16 @@ def cached_lemmatize_word_flexibly(word_to_lemmatize: str, debug_mode_for_messag
 
 def get_primary_lemmas_from_normalized_text(normalized_text: str, debug_mode: bool = False) -> Set[str]:
     if not normalized_text: return set()
-    lemmas = morph.lemmatize(normalized_text)
-    cleaned_lemmas = {token.lower() for token in lemmas if token.strip().isalnum()}
+    tokens = [t for t in normalized_text.split() if t.strip()]
+    lemmas = []
+    for t in tokens:
+        try:
+            parsed = morph.parse(t)
+            if parsed:
+                lemmas.append(parsed[0].normal_form.lower())
+        except Exception:
+            continue
+    cleaned_lemmas = {token for token in lemmas if token.strip().isalnum()}
     if debug_mode:
         if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
         text_sample = normalized_text[:50] + "..." if len(normalized_text) > 50 else normalized_text
@@ -239,105 +261,134 @@ def check_exact_phrases(text: str, phrases_input: Optional[Any], debug_mode: boo
     return results
 
 def check_lsi_phrases(raw_page_text: str, phrases_input: Optional[Any], debug_mode: bool = False) -> Dict[str, bool]:
-    enable_truncation = st.session_state.get('enable_lsi_truncation', DEFAULT_ENABLE_LSI_TRUNCATION)
-    trunc_max_remove = st.session_state.get('lsi_trunc_max_remove', DEFAULT_LSI_TRUNC_MAX_REMOVE)
-    trunc_min_orig_len = st.session_state.get('lsi_trunc_min_orig_len', DEFAULT_LSI_TRUNC_MIN_ORIG_LEN)
-    trunc_min_final_len = st.session_state.get('lsi_trunc_min_final_len', DEFAULT_LSI_TRUNC_MIN_FINAL_LEN)
-    current_fuzzy_thresh = st.session_state.get('stem_fuzzy_ratio_threshold', DEFAULT_STEM_FUZZY_RATIO_THRESHOLD)
-
-    if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
-
+    """Проверяет наличие LSI-фраз в тексте с улучшенным поиском слов"""
     if not raw_page_text or not phrases_input or (isinstance(phrases_input, float) and pd.isna(phrases_input)):
-        if debug_mode: st.session_state.debug_messages.append("### LSI Debug: Нет данных LSI или текст страницы пуст.")
+        if debug_mode:
+            st.session_state.debug_messages.append("LSI Debug: Нет текста или фраз для проверки")
         return {}
-
-    if debug_mode:
-        st.session_state.debug_messages.append(f"--- LSI: Входной raw_page_text (первые 300 симв.): ---")
-        st.session_state.debug_messages.append(raw_page_text[:300] + "...")
-        st.session_state.debug_messages.append(f"(Общая длина raw_page_text: {len(raw_page_text)})")
-
+    
+    # Инициализируем отладочные сообщения, если нужно
+    if 'debug_messages' not in st.session_state:
+        st.session_state.debug_messages = []
+    
+    # Нормализуем текст страницы
     normalized_page_content = normalize_for_search(raw_page_text)
-
-    if debug_mode:
-        st.session_state.debug_messages.append(f"--- LSI: Текст ПОСЛЕ normalize_for_search (первые 300 симв.): ---")
-        st.session_state.debug_messages.append(normalized_page_content[:300] + "...")
-        st.session_state.debug_messages.append(f"(Общая длина normalized_page_content: {len(normalized_page_content)}, слов примерно: {len(normalized_page_content.split()) if normalized_page_content else 0})")
-
-    if not normalized_page_content:
-        if debug_mode: st.session_state.debug_messages.append("LSI Debug: Текст страницы стал пустым после нормализации. LSI фразы не будут найдены.")
-        return {f"{PREFIX_LSI_PHRASE}{p.strip()}": False for p in split_phrases(phrases_input) if p.strip()}
-
-    page_lemmas_set = get_primary_lemmas_from_normalized_text(normalized_page_content, debug_mode)
-    page_stems_set = set()
-    if RUSSIAN_STEMMER:
-        for word_from_norm_page in normalized_page_content.split():
-            stemmed_page_word = get_stem_for_word(word_from_norm_page)
-            if stemmed_page_word: page_stems_set.add(stemmed_page_word)
-        if debug_mode:
-            if page_stems_set: st.session_state.debug_messages.append(f"[Page Stems] Найдено {len(page_stems_set)} уник. основ. Пример: {list(page_stems_set)[:10]}")
-            elif RUSSIAN_STEMMER: st.session_state.debug_messages.append("[Page Stems] Основы на странице не найдены.")
-
+    page_words = set(normalized_page_content.split())
+    
+    # Получаем настройки
+    current_fuzzy_thresh = st.session_state.get('stem_fuzzy_ratio_threshold', DEFAULT_STEM_FUZZY_RATIO_THRESHOLD)
+    
+    # Обрабатываем каждую фразу
     phrases_list = split_phrases(phrases_input)
-    lsi_results = {}
+    results = {}
+    
+    # Создаем кэш для лемм и основ слов на странице
+    page_lemmas_cache = {}
+    page_stems_cache = {}
+    
     for phrase in phrases_list:
-        if not phrase.strip(): continue
-        normalized_lsi_phrase = normalize_for_search(phrase)
-        lsi_phrase_words = [w for w in normalized_lsi_phrase.split() if w]
-        if not lsi_phrase_words:
-            lsi_results[f"{PREFIX_LSI_PHRASE}{phrase}"] = False
-            if debug_mode: st.session_state.debug_messages.append({'LSI_фраза': phrase, 'статус': 'Фраза пуста после нормализации'})
+        if not phrase.strip():
             continue
-        all_words_in_lsi_found = True
-        debug_lsi_word_checks = []
-        for word_in_lsi_phrase in lsi_phrase_words:
-            found_this_word = False; match_type = "нет"; matched_page_word_for_display = ""
-            possible_lemmas_for_lsi_word = cached_lemmatize_word_flexibly(word_in_lsi_phrase, debug_mode)
-            if possible_lemmas_for_lsi_word and any(lemma in page_lemmas_set for lemma in possible_lemmas_for_lsi_word):
-                found_this_word = True; match_type = "лемма (гибкая LSI -> основная стр.)"
-            lsi_word_stem = None
-            if not found_this_word and RUSSIAN_STEMMER:
-                lsi_word_stem = get_stem_for_word(word_in_lsi_phrase)
-                if lsi_word_stem:
-                    if lsi_word_stem in page_stems_set: found_this_word = True; match_type = "основа (точное совпадение)"
-                    elif not found_this_word and RAPIDFUZZ_AVAILABLE and page_stems_set:
-                        best_fuzzy_match_ratio = 0
-                        for page_stem_candidate in page_stems_set:
-                            ratio = fuzz.ratio(lsi_word_stem, page_stem_candidate)
-                            if ratio >= current_fuzzy_thresh and ratio > best_fuzzy_match_ratio:
-                                best_fuzzy_match_ratio = ratio; found_this_word = True
-                        if found_this_word: match_type = f"основа (нечеткое, схожесть {best_fuzzy_match_ratio:.0f}%)"
-            truncation_info_for_debug = None
-            if not found_this_word and enable_truncation:
-                original_len = len(word_in_lsi_phrase)
-                if original_len >= trunc_min_orig_len:
-                    for chars_to_remove in range(1, trunc_max_remove + 1):
-                        current_truncated_len = original_len - chars_to_remove
-                        if current_truncated_len < trunc_min_final_len: break
-                        truncated_lsi_word = word_in_lsi_phrase[:current_truncated_len]
-                        try:
-                            pattern = r'\b' + re.escape(truncated_lsi_word) + r'\w*\b'
-                            match_object = re.search(pattern, normalized_page_content)
-                            if match_object:
-                                found_this_word = True; matched_page_word_for_display = match_object.group(0)
-                                match_type = f"усечение до '{truncated_lsi_word}' (найдено: '{matched_page_word_for_display}')"
-                                truncation_info_for_debug = {'truncated_to': truncated_lsi_word, 'matched_on_page': matched_page_word_for_display}; break
-                        except re.error as e_re:
-                            if debug_mode: st.session_state.debug_messages.append(f"Ошибка Regex (усечение) для '{truncated_lsi_word}': {e_re}")
-                            continue
-            if debug_mode:
-                debug_entry = {'слово_LSI_фразы': word_in_lsi_phrase, 'леммы_LSI_слова': list(possible_lemmas_for_lsi_word),
-                               'основа_LSI_слова': lsi_word_stem if lsi_word_stem else (get_stem_for_word(word_in_lsi_phrase) if RUSSIAN_STEMMER else "N/A"),
-                               'найдено': found_this_word, 'тип_совпадения': match_type}
-                if truncation_info_for_debug: debug_entry['детали_усечения'] = truncation_info_for_debug
-                debug_lsi_word_checks.append(debug_entry)
-            if not found_this_word: all_words_in_lsi_found = False; break
-        lsi_results[f"{PREFIX_LSI_PHRASE}{phrase}"] = all_words_in_lsi_found
+            
+        normalized_phrase = normalize_for_search(phrase)
+        phrase_words = [w for w in normalized_phrase.split() if w and len(w) > 1]  # Игнорируем слишком короткие слова
+        
+        if not phrase_words:
+            results[f"{PREFIX_LSI_PHRASE}{phrase}"] = False
+            continue
+            
+        all_words_found = True
+        debug_info = []
+        
+        for word in phrase_words:
+            word_found = False
+            match_type = 'не найдено'
+            matched_words = []
+            
+            # 1. Проверяем точное совпадение
+            if word in page_words:
+                word_found = True
+                match_type = 'точное совпадение'
+                matched_words.append(word)
+            
+            # 2. Проверяем частичное вхождение (если слово длинное)
+            if not word_found and len(word) > 4:
+                for page_word in page_words:
+                    if word in page_word or page_word in word:
+                        word_found = True
+                        match_type = 'частичное совпадение'
+                        matched_words.append(page_word)
+            
+            # 3. Проверяем леммы
+            if not word_found:
+                # Кэшируем леммы для слова
+                if word not in page_lemmas_cache:
+                    page_lemmas_cache[word] = cached_lemmatize_word_flexibly(word, debug_mode)
+                word_lemmas = page_lemmas_cache[word]
+                
+                for page_word in page_words:
+                    # Кэшируем леммы для слов на странице
+                    if page_word not in page_lemmas_cache:
+                        page_lemmas_cache[page_word] = cached_lemmatize_word_flexibly(page_word, debug_mode)
+                    
+                    if word_lemmas & page_lemmas_cache[page_word]:  # Пересечение множеств лемм
+                        word_found = True
+                        match_type = 'совпадение по лемме'
+                        matched_words.append(page_word)
+            
+            # 4. Проверяем основы слов (если доступен стеммер)
+            if not word_found and RUSSIAN_STEMMER:
+                # Кэшируем основу для слова
+                if word not in page_stems_cache:
+                    page_stems_cache[word] = get_stem_for_word(word)
+                word_stem = page_stems_cache[word]
+                
+                if word_stem:
+                    for page_word in page_words:
+                        # Кэшируем основы для слов на странице
+                        if page_word not in page_stems_cache:
+                            page_stems_cache[page_word] = get_stem_for_word(page_word)
+                        
+                        if page_stems_cache[page_word] and word_stem == page_stems_cache[page_word]:
+                            word_found = True
+                            match_type = 'совпадение по основе слова'
+                            matched_words.append(page_word)
+            
+            # 5. Нечеткое сравнение (если доступно)
+            if not word_found and RAPIDFUZZ_AVAILABLE and len(word) > 3:  # Только для слов длиннее 3 символов
+                for page_word in page_words:
+                    if len(page_word) > 3:  # И только с другими словами длиннее 3 символов
+                        ratio = fuzz.ratio(word, page_word)
+                        if ratio >= current_fuzzy_thresh:
+                            word_found = True
+                            match_type = f'нечеткое совпадение ({ratio}%)'
+                            matched_words.append(page_word)
+                            break  # Берем первое хорошее совпадение
+            
+            # Добавляем отладочную информацию
+            debug_info.append({
+                'слово': word,
+                'найдено': word_found,
+                'тип_совпадения': match_type,
+                'совпадения': list(set(matched_words))[:5]  # Ограничиваем количество выводимых совпадений
+            })
+            
+            if not word_found:
+                all_words_found = False
+                # Не прерываем цикл, чтобы собрать отладочную информацию по всем словам
+        
+        results[f"{PREFIX_LSI_PHRASE}{phrase}"] = all_words_found
+        
         if debug_mode:
-            st.session_state.debug_messages.append({'type': 'lsi_phrase_full_debug', 'phrase_original': phrase,
-                                                    'details': {'оригинал_LSI_фразы': phrase, 'нормализованная_LSI_фраза': normalized_lsi_phrase,
-                                                                'целевые_слова_фразы': lsi_phrase_words, 'детали_проверки_слов': debug_lsi_word_checks,
-                                                                'итог_фраза_найдена': all_words_in_lsi_found}})
-    return lsi_results
+            st.session_state.debug_messages.append({
+                'type': 'lsi_phrase_debug',
+                'оригинальная_фраза': phrase,
+                'нормализованная_фраза': normalized_phrase,
+                'все_слова_найдены': all_words_found,
+                'отладка_слов': debug_info
+            })
+    
+    return results
 
 @st.cache_data(ttl=3600)
 def get_page_data_for_lang(base_ru_url: str, lang_to_fetch: str, debug_mode_internal: bool = False,
@@ -719,7 +770,7 @@ async def run_all_checks_async(
                 result_item = await future
                 all_individual_check_results.append(result_item)
             except Exception as e_task:
-                all_individual_check_results.append({
+                 all_individual_check_results.append({
                     "ID аптеки (исходный)": f"Ошибка асинхр. задачи (неизвестный ID)",
                     "Тип файла (проверенный)": "ERROR",
                     "Проверяемый URL": "N/A", "Конечный URL проверки": "N/A",
@@ -901,7 +952,7 @@ def main():
     )
     # ========== ВКЛАДКА: GPT-ассистент ==========
     if tab == "🤖 GPT-ассистент":
-        import openai
+        from openai import OpenAI
         import time
         from streamlit.components.v1 import html as st_html
         st.title("🤖 GPT-ассистент (OpenAI)")
@@ -1005,8 +1056,7 @@ def main():
         """, unsafe_allow_html=True)
 
         # --- API KEY (set here, not in UI) ---
-        OPENAI_API_KEY = "sk-..."  # <-- ВСТАВЬТЕ СВОЙ КЛЮЧ СЮДА
-        openai.api_key = OPENAI_API_KEY
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
         # --- Session state for chat ---
         if 'gpt_chat_history' not in st.session_state:
@@ -1061,12 +1111,12 @@ def main():
             st.session_state.gpt_chat_history.append({"role": "user", "content": user_input.strip()})
             try:
                 with st.spinner("GPT думает..."):
-                    response = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=st.session_state.gpt_chat_history,
-                        temperature=0.7,
-                        max_tokens=1024,
-                    )
+                    response = client.chat.completions.create(
+                     model="gpt-3.5-turbo",
+                     messages=st.session_state.gpt_chat_history,
+                     temperature=0.7,
+                     max_tokens=1024,
+    )
                     answer = response.choices[0].message.content.strip()
                     st.session_state.gpt_chat_history.append({"role": "assistant", "content": answer})
                     st.session_state.gpt_user_input = ""
@@ -1492,7 +1542,8 @@ def main():
         </style>
         """, unsafe_allow_html=True)
 
-        if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
+        if 'debug_messages' not in st.session_state:
+            st.session_state.debug_messages = []
         if RUSSIAN_STEMMER is None and 'stemmer_warning_shown' not in st.session_state:
             st.warning("Русский стеммер (PyStemmer) не инициализирован...")
             st.session_state.stemmer_warning_shown = True
