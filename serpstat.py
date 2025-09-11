@@ -24,6 +24,12 @@ import traceback
 import asyncio
 import aiohttp
 import time
+# --- Функция для унификации тире ---
+def unify_dashes(text: str) -> str:
+    """Заменяет все длинные тире и похожие символы на обычный дефис"""
+    if not isinstance(text, str):
+        return text
+    return text.replace("—", "-").replace("–", "-")
 
 # =================== НАСТРОЙКИ ===================
 load_dotenv()
@@ -577,7 +583,7 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
         st.error(f"Для языка {lang_to_check.upper()}: В Excel отсутствуют ОБЯЗАТЕЛЬНЫЕ колонки для проверки мета-тегов: {', '.join(missing_cols_in_df)}. "
                  f"Ожидались: {', '.join(required_cols_for_run)}")
         return
-    sub_tab_meta, sub_tab_phrases = st.tabs([f"📋 Общая проверка Title/Description", f"🔍 Проверка фraz"])
+    sub_tab_meta, sub_tab_phrases = st.tabs([f"📋 Общая проверка Title/Description", f"🔍 Проверка фраз"])
     with sub_tab_meta:
         tab1_errors_summary = {'load_error': 0, 'title_mismatch': 0, 'desc_mismatch': 0}
         tab1_processed_rows_data, urls_with_meta_issues_list_tab1 = [], []
@@ -593,8 +599,13 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                 expected_desc = str(row_from_df.get(expected_desc_col, "")).strip()
                 site_title = page_lang_specific_data.get('title', "").strip()
                 site_desc = page_lang_specific_data.get('description', "").strip()
-                title_match = normalize_for_search(site_title) == normalize_for_search(expected_title) if expected_title else (not site_title)
-                desc_match = normalize_for_search(site_desc) == normalize_for_search(expected_desc) if expected_desc else (not site_desc)
+                # Унифицируем тире перед сравнением
+                expected_title_unified = unify_dashes(expected_title)
+                expected_desc_unified = unify_dashes(expected_desc)
+                site_title_unified = unify_dashes(site_title)
+                site_desc_unified = unify_dashes(site_desc)
+                title_match = normalize_for_search(site_title_unified) == normalize_for_search(expected_title_unified) if expected_title else (not site_title)
+                desc_match = normalize_for_search(site_desc_unified) == normalize_for_search(expected_desc_unified) if expected_desc else (not site_desc)
                 item_details.update({'expected_title': expected_title, 'expected_desc': expected_desc, 'site_title': site_title, 'site_desc': site_desc, 'title_match': title_match, 'desc_match': desc_match})
                 if not title_match: tab1_errors_summary['title_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Title не совпадает')
                 if not desc_match: tab1_errors_summary['desc_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Desc не совпадает')
