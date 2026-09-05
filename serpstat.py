@@ -1308,6 +1308,16 @@ def main():
 
             if uploaded_file:
                 df = pd.read_excel(uploaded_file)
+                df.columns = df.columns.str.strip()
+                url_col = next((c for c in df.columns if str(c).strip().lower() == 'url'), None)
+                if url_col is None:
+                    st.error(
+                        "В файле не найдена колонка **URL**. "
+                        f"Найденные колонки: {', '.join(map(str, df.columns))}"
+                    )
+                    st.stop()
+                if url_col != 'URL':
+                    df = df.rename(columns={url_col: 'URL'})
                 st.success("Файл загружен успешно. Начинаю проверку...")
                 progress_bar = st.progress(0)
                 status_text = st.empty()
