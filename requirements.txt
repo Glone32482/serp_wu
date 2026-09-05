@@ -12,3 +12,4 @@ pystemmer
 rapidfuzz
 aiohttp
 openai
+xlsxwriter

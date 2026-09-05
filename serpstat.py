@@ -35,7 +35,7 @@ def unify_dashes(text: str) -> str:
 load_dotenv()
 st.set_page_config(page_title="SEO-комбайн", layout="wide", page_icon="🧙‍♂️")
 
-API_TOKEN = "13aef476b8d8f6252959163f5d49812b"
+API_TOKEN = os.getenv("SERPSTAT_TOKEN")  # задаётся в .env локально или в Streamlit Secrets
 API_URL = f"https://api.serpstat.com/v4?token={API_TOKEN}" if API_TOKEN else None
 
 AUTO_EXTEND = {
@@ -1199,7 +1199,6 @@ def main():
         import altair as alt
         from difflib import SequenceMatcher
 
-        st.set_page_config(page_title="SEO Мета-Проверка Apteka 9-1-1", layout="wide")
         st.title("🔍 SEO Мета-Проверка для сайта Apteka 9-1-1")
 
         st.markdown("""
@@ -1280,6 +1279,7 @@ def main():
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
                 soup = BeautifulSoup(response.text, 'html.parser')
                 title = soup.title.string.strip() if soup.title else ''
                 description = ''
@@ -1287,8 +1287,8 @@ def main():
                 if tag and tag.get("content"):
                     description = tag["content"].strip()
                 return title, description
-            except:
-                return '', ''
+            except requests.exceptions.RequestException as e:
+                return f'[ошибка загрузки: {e}]', ''
 
         tabs2 = st.tabs(["Загрузка", "Результаты"])
 
