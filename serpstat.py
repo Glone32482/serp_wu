@@ -35,9 +35,6 @@ def unify_dashes(text: str) -> str:
 load_dotenv()
 st.set_page_config(page_title="SEO-комбайн", layout="wide", page_icon="🧙‍♂️")
 
-API_TOKEN = os.getenv("SERPSTAT_TOKEN")  # задаётся в .env локально или в Streamlit Secrets
-API_URL = f"https://api.serpstat.com/v4?token={API_TOKEN}" if API_TOKEN else None
-
 AUTO_EXTEND = {
     "always": "always прокладки",
     "олвейс": "олвейс прокладки",
@@ -103,10 +100,11 @@ def filter_phrases(phrases, relevant_words=RELEVANT_WORDS, top_n=10):
             break
     return filtered[:top_n] if filtered else phrases[:top_n]  # Возвращаем хотя бы топ-N, если фильтр пуст
 
-def get_serpstat_phrases_top_filtered(keyword, top_n=10):
-    if not API_TOKEN:
-        st.error("API-токен Serpstat не настроен. Проверь файл .env.")
+def get_serpstat_phrases_top_filtered(keyword, api_token, top_n=10):
+    if not api_token:
+        st.error("Введите API-токен Serpstat в поле выше.")
         return []
+    api_url = f"https://api.serpstat.com/v4?token={api_token}"
     keyword_query = build_query(keyword)
     payload = {
         "id": "1",
@@ -121,7 +119,7 @@ def get_serpstat_phrases_top_filtered(keyword, top_n=10):
     }
     try:
         st.write(f"Запрос к API для ключевого слова: {keyword_query}")
-        resp = requests.post(API_URL, json=payload, timeout=30)
+        resp = requests.post(api_url, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
         st.write(f"Ответ от API: {result}")
@@ -1404,37 +1402,47 @@ def main():
     if tab == "🔎 Подбор ключей (Serpstat)":
         st.title("🔎 Автоматизированный подбор ключей для семантического ядра")
 
+        serpstat_api_token = st.text_input(
+            "API-токен Serpstat",
+            type="password",
+            key="serpstat_api_token_input",
+            help="Токен из личного кабинета Serpstat. Используется только для запросов в этой сессии и нигде не сохраняется."
+        )
+
         uploaded_file = st.file_uploader("Загрузи Excel-файл (.xlsx) с Названием, URL и Фразы", type=["xlsx"])
         start_button = st.button("🚀 Запустить обработку")
 
         if uploaded_file and start_button:
-            with st.spinner("Обрабатываем файл..."):
-                df = pd.read_excel(uploaded_file)
-                if "Название" not in df.columns or "URL" not in df.columns or "Фразы в точном вхождении" not in df.columns:
-                    st.error("В Excel должны быть столбцы 'Название', 'URL' и 'Фразы в точном вхождении'!")
-                else:
-                    df["Фразы в точном вхождении"] = ""
-                    total = len(df)
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    for idx, row in df.iterrows():
-                        name = str(row["Название"]).strip()
-                        phrases = get_serpstat_phrases_top_filtered(name, top_n=10)
-                        df.at[idx, "Фразы в точном вхождении"] = "\n".join(phrases) if phrases else "Нет данных"
-                        progress = (idx + 1) / total
-                        progress_bar.progress(progress)
-                        status_text.text(f"Обработано {idx+1} из {total}...")
-                    progress_bar.progress(1.0)
-                    status_text.text("✅ Готово! Можно скачивать результат.")
-                    st.success("Готово! Скачай Excel ниже 👇")
-                    output = io.BytesIO()
-                    df.to_excel(output, index=False)
-                    st.download_button(
-                        label="💾 Скачать результат",
-                        data=output.getvalue(),
-                        file_name="ключевые_фразы_по_таблице.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+            if not serpstat_api_token:
+                st.error("Сначала введите API-токен Serpstat в поле выше — без него запросы к API не пройдут.")
+            else:
+                with st.spinner("Обрабатываем файл..."):
+                    df = pd.read_excel(uploaded_file)
+                    if "Название" not in df.columns or "URL" not in df.columns or "Фразы в точном вхождении" not in df.columns:
+                        st.error("В Excel должны быть столбцы 'Название', 'URL' и 'Фразы в точном вхождении'!")
+                    else:
+                        df["Фразы в точном вхождении"] = ""
+                        total = len(df)
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        for idx, row in df.iterrows():
+                            name = str(row["Название"]).strip()
+                            phrases = get_serpstat_phrases_top_filtered(name, serpstat_api_token, top_n=10)
+                            df.at[idx, "Фразы в точном вхождении"] = "\n".join(phrases) if phrases else "Нет данных"
+                            progress = (idx + 1) / total
+                            progress_bar.progress(progress)
+                            status_text.text(f"Обработано {idx+1} из {total}...")
+                        progress_bar.progress(1.0)
+                        status_text.text("✅ Готово! Можно скачивать результат.")
+                        st.success("Готово! Скачай Excel ниже 👇")
+                        output = io.BytesIO()
+                        df.to_excel(output, index=False)
+                        st.download_button(
+                            label="💾 Скачать результат",
+                            data=output.getvalue(),
+                            file_name="ключевые_фразы_по_таблице.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
 
     # ========== ВКЛАДКА 2: Анализ уникальных слов ==========
     elif tab == "🧙 Анализ уникальных слов":
