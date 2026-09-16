@@ -610,11 +610,15 @@ def get_page_data_for_lang(base_ru_url: str, lang_to_fetch: str, debug_mode_inte
     return {**extracted, 'error': error_message, 'final_url_fetched': final_url_after_redirects}
 
 async def _fetch_page_data_async(http_session: "aiohttp.ClientSession", semaphore: asyncio.Semaphore,
-                                  base_ru_url: str, lang_to_fetch: str) -> Dict[str, Any]:
+                                  base_ru_url: str, lang_to_fetch: str, max_retries: int = 2) -> Dict[str, Any]:
     """Асинхронный аналог get_page_data_for_lang для массовой загрузки —
     та же логика построения URL и разбора HTML (через общие _build_lang_url()
     и _extract_page_content()), но через aiohttp и под семафором, как во
-    вкладке проверки картинок аптек, вместо последовательных requests.get()."""
+    вкладке проверки картинок аптек, вместо последовательных requests.get().
+    Делает до max_retries повторных попыток с нарастающей задержкой при
+    сетевых ошибках/5xx (например 503 Service Temporarily Unavailable) —
+    раньше один такой временный отказ сайта сразу помечал URL как "не удалось
+    загрузить", хотя сайт часто уже через секунду-две отвечает нормально."""
     async with semaphore:
         headers = {
             'User-Agent': DEFAULT_USER_AGENT,
@@ -629,19 +633,24 @@ async def _fetch_page_data_async(http_session: "aiohttp.ClientSession", semaphor
         modified_url_with_query = _build_lang_url(base_ru_url, lang_to_fetch)
         result = {'_source_url': base_ru_url, '_lang': lang_to_fetch, 'title': '', 'description': '',
                   'full_text': '', 'error': None, 'final_url_fetched': modified_url_with_query}
-        try:
-            async with http_session.get(modified_url_with_query, headers=headers, cookies=cookies,
-                                         timeout=aiohttp.ClientTimeout(total=20), ssl=False,
-                                         allow_redirects=True) as response:
-                response.raise_for_status()
-                final_url_after_redirects = str(response.url)
-                raw_bytes = await response.read()
-                html_content = raw_bytes.decode('utf-8', errors='ignore')
-        except Exception as e:
-            result['error'] = f"Ошибка запроса к {modified_url_with_query}: {e}"
-            return result
-        result.update(_extract_page_content(html_content, final_url_after_redirects))
-        result['final_url_fetched'] = final_url_after_redirects
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with http_session.get(modified_url_with_query, headers=headers, cookies=cookies,
+                                             timeout=aiohttp.ClientTimeout(total=20), ssl=False,
+                                             allow_redirects=True) as response:
+                    response.raise_for_status()
+                    final_url_after_redirects = str(response.url)
+                    raw_bytes = await response.read()
+                    html_content = raw_bytes.decode('utf-8', errors='ignore')
+                result.update(_extract_page_content(html_content, final_url_after_redirects))
+                result['final_url_fetched'] = final_url_after_redirects
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        result['error'] = f"Ошибка запроса к {modified_url_with_query}: {last_error}"
         return result
 
 async def _load_all_pages_data_for_both_langs_async(dataframe: pd.DataFrame, max_concurrent: int,
