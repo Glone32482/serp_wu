@@ -159,29 +159,38 @@ def get_serpstat_phrases_top_filtered(keyword, api_token, top_n=10):
         st.error(f"Неожиданная ошибка при запросе к API: {str(e)}")
         return []
 
-def analyze_texts(text1: str, text2: str) -> str:
-    try:
-        morph = pymorphy3.MorphAnalyzer()
-    except Exception as e:
-        st.error(f"Ошибка при инициализации морфологического анализатора: {e}")
-        return "Не удалось выполнить анализ."
-
+def analyze_texts(text1: str, text2: str) -> Tuple[str, List[Tuple[str, int]]]:
     text1_cleaned = re.sub(r'\s+', ' ', text1)
     text2_cleaned = re.sub(r'\s+', ' ', text2)
+
     def get_lemmas(text: str) -> list:
-        words = re.findall(r'\b[а-яА-ЯёЁ-]+\b', text.lower())
-        lemmas = [morph.parse(word)[0].normal_form for word in words]
+        # Добавили украинские буквы і/ї/є/ґ — раньше слова вида "відгуки"
+        # разбивались на куски ("в" + "дгуки"), как и в normalize_for_search().
+        # Также кэшируем лемму по слову внутри вызова: раньше morph.parse()
+        # вызывался заново на каждом повторе одного и того же слова.
+        words = re.findall(r"\b[а-яёіїєґ'-]+\b", text.lower(), flags=re.IGNORECASE)
+        cache = {}
+        lemmas = []
+        for word in words:
+            if word not in cache:
+                try:
+                    cache[word] = morph.parse(word)[0].normal_form
+                except Exception:
+                    cache[word] = word
+            lemmas.append(cache[word])
         return lemmas
 
     lemmas1_set = set(get_lemmas(text1_cleaned))
     all_lemmas_from_text2 = get_lemmas(text2_cleaned)
     unique_lemmas = [lemma for lemma in all_lemmas_from_text2 if lemma not in lemmas1_set]
     if not unique_lemmas:
-        return "Во втором тексте не найдено уникальных слов, отсутствующих в первом."
+        return "Во втором тексте не найдено уникальных слов, отсутствующих в первом.", []
     frequency_counter = Counter(unique_lemmas)
     sorted_lemmas = sorted(frequency_counter.items(), key=lambda x: (-x[1], x[0]))
     result_markdown = [f"- **{word}** — {count} раз(а)" for word, count in sorted_lemmas[:300]]
-    return "\n".join(result_markdown)
+    if len(sorted_lemmas) > 300:
+        result_markdown.append(f"\n*Показаны первые 300 из {len(sorted_lemmas)} слов — полный список можно скачать ниже.*")
+    return "\n".join(result_markdown), sorted_lemmas
 
 # ========== НОВАЯ ВКЛАДКА: SEO Meta Checker ==========
 def clean_text(text: Optional[Any]) -> str:
@@ -1652,10 +1661,19 @@ def main():
         if st.button("🚀 Начать анализ", use_container_width=True):
             if st.session_state.text1 and st.session_state.text2:
                 with st.spinner("Пожалуйста, подождите, идёт обработка текстов..."):
-                    analysis_result = analyze_texts(st.session_state.text1, st.session_state.text2)
+                    analysis_result, unique_lemmas_data = analyze_texts(st.session_state.text1, st.session_state.text2)
                 st.header("Результат анализа")
                 st.markdown("---")
                 st.markdown(analysis_result)
+                if unique_lemmas_data:
+                    unique_words_df = pd.DataFrame(unique_lemmas_data, columns=["Слово", "Частота"])
+                    st.download_button(
+                        "📥 Скачать полный список уникальных слов",
+                        data=unique_words_df.to_csv(index=False, encoding='utf-8-sig'),
+                        file_name="уникальные_слова.csv",
+                        mime="text/csv",
+                        key="dl_unique_words_csv"
+                    )
             else:
                 st.error("❗ Пожалуйста, введите тексты в оба поля для анализа.")
 
@@ -1688,7 +1706,18 @@ def main():
             input_text = st.text_area("✍️ Вставьте текст", height=300)
         else:
             uploaded_file = st.file_uploader("📄 Загрузите .txt файл", type=["txt"])
-            input_text = uploaded_file.read().decode("utf-8") if uploaded_file else ""
+            input_text = ""
+            if uploaded_file:
+                raw_bytes = uploaded_file.read()
+                try:
+                    input_text = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    try:
+                        input_text = raw_bytes.decode("cp1251")
+                        st.info("Файл не в UTF-8 — прочитан как Windows-1251.")
+                    except UnicodeDecodeError:
+                        st.error("Не удалось прочитать файл ни в UTF-8, ни в Windows-1251. "
+                                 "Пересохраните .txt в кодировке UTF-8 и загрузите заново.")
 
         keyword_block = st.text_area("📋 Список слов (по одному на строку):", height=200)
         keywords = [w.strip().lower() for w in keyword_block.strip().splitlines() if w.strip()]
@@ -1697,29 +1726,38 @@ def main():
             if not input_text or not keywords:
                 st.warning("Пожалуйста, введите текст и список слов.")
             else:
-                html_text = input_text
-                for word in keywords:
-                    pattern = re.compile(rf'\b({re.escape(word)}\w*)\b', flags=re.IGNORECASE)
-                    html_text = pattern.sub(r'<span style="background-color:yellow;">\1</span>', html_text)
-                st.markdown("### 👀 Просмотр с подсветкой:")
-                st.markdown(f"<div style='line-height:1.6'>{html_text}</div>", unsafe_allow_html=True)
+                with st.spinner("Обрабатываем текст..."):
+                    html_text = input_text
+                    for word in keywords:
+                        pattern = re.compile(rf'\b({re.escape(word)}\w*)\b', flags=re.IGNORECASE)
+                        html_text = pattern.sub(r'<span style="background-color:yellow;">\1</span>', html_text)
 
-                doc = Document()
-                paragraph = doc.add_paragraph()
-                words = re.split(r'(\W+)', input_text)
-                for word in words:
-                    clean_word = re.sub(r'\W+', '', word).lower()
-                    match = any(re.fullmatch(rf'{re.escape(k)}\w*', clean_word, re.IGNORECASE) for k in keywords)
-                    run = paragraph.add_run(word)
-                    if match:
-                        run.font.highlight_color = 7  # жёлтый
-                buffer = BytesIO()
-                doc.save(buffer)
-                buffer.seek(0)
-                b64 = base64.b64encode(buffer.read()).decode()
-                href = f'<a href="data:application/octet-stream;base64,{b64}" download="highlighted.docx">📥 Скачать как DOCX</a>'
-                st.markdown("### 💾 Скачай файл, если всё ок:")
-                st.markdown(href, unsafe_allow_html=True)
+                    # Строим DOCX построчно (doc.add_paragraph() на каждую строку
+                    # исходного текста), а не одним общим параграфом — иначе все
+                    # переносы строк из оригинала терялись и получался один
+                    # сплошной абзац в выгруженном файле.
+                    doc = Document()
+                    for line in input_text.split("\n"):
+                        paragraph = doc.add_paragraph()
+                        tokens = re.split(r'(\W+)', line)
+                        for token in tokens:
+                            clean_token = re.sub(r'\W+', '', token).lower()
+                            match = bool(clean_token) and any(re.fullmatch(rf'{re.escape(k)}\w*', clean_token, re.IGNORECASE) for k in keywords)
+                            run = paragraph.add_run(token)
+                            if match:
+                                run.font.highlight_color = 7  # жёлтый
+                    buffer = BytesIO()
+                    doc.save(buffer)
+
+                st.markdown("### 👀 Просмотр с подсветкой:")
+                st.markdown(f"<div style='line-height:1.6'>{html_text.replace(chr(10), '<br>')}</div>", unsafe_allow_html=True)
+                st.download_button(
+                    "📥 Скачать как DOCX",
+                    data=buffer.getvalue(),
+                    file_name="highlighted.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_highlighted_docx"
+                )
 
     # ========== ВКЛАДКА 4: SEO Meta Checker ==========
     elif tab == "🔍 SEO Meta Checker":
