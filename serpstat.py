@@ -1913,7 +1913,7 @@ def main():
                     html_text = input_text
                     for word in keywords:
                         pattern = re.compile(rf'\b({re.escape(word)}\w*)\b', flags=re.IGNORECASE)
-                        html_text = pattern.sub(r'<span style="background-color:yellow;">\1</span>', html_text)
+                        html_text = pattern.sub(r'<span style="background-color:yellow; color:#1a1a1a;">\1</span>', html_text)
 
                     # Строим DOCX построчно (doc.add_paragraph() на каждую строку
                     # исходного текста), а не одним общим параграфом — иначе все
@@ -1957,14 +1957,22 @@ def main():
         st.markdown("Проверка мета-тегов и фраз на веб-страницах сайта Apteka911.")
         st.markdown("""
         <style>
-        .info-box { background-color: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 5px; padding: 10px; margin: 10px 0; }
-        .result-content { margin: 5px 0; padding: 8px; background: white; border: 1px solid #eee; border-radius: 3px; font-size: 0.95em; word-wrap: break-word; }
+        /* У этих карточек фиксированный светлый фон (специально, для контраста
+           с любой темой приложения) — поэтому цвет текста внутри тоже фиксируем,
+           иначе он наследует цвет темы: на тёмной теме текст становится светлым
+           и становится нечитаемым на светлом фоне карточки. */
+        .info-box { background-color: #f8f9fa; color: #1a1a1a; border: 1px solid #e0e0e0; border-radius: 5px; padding: 10px; margin: 10px 0; }
+        .result-content { margin: 5px 0; padding: 8px; background: #ffffff; color: #1a1a1a; border: 1px solid #eee; border-radius: 3px; font-size: 0.95em; word-wrap: break-word; }
         .result-content b { font-weight: 600; }
         .stTabs [data-baseweb="tab-list"] { gap: 8px; }
         .stTabs [data-baseweb="tab-list"] .stTabs [data-baseweb="tab-list"] { gap: 4px; }
         .stTabs [data-baseweb="tab"] { height: 50px; padding: 0 25px; margin-right: 0; border-radius: 5px 5px 0 0; }
-        .stTabs [aria-selected="true"] { background-color: #e6f2ff; border-bottom: 2px solid #007bff; }
-        .stMetric { border: 1px solid #ddd; border-radius: 5px; padding: 10px; background-color: #f9f9f9;}
+        .stTabs [aria-selected="true"] { border-bottom: 2px solid #FFCC38; }
+        /* Раньше здесь был свой светлый фон для st.metric — на тёмной теме это
+           давало те же "светлый блок + светлый текст" проблемы, как выше.
+           Теперь карточка метрики просто использует фон/текст текущей темы
+           приложения, только с рамкой. */
+        .stMetric { border: 1px solid rgba(128, 128, 128, 0.35); border-radius: 5px; padding: 10px; }
         </style>
         """, unsafe_allow_html=True)
 
