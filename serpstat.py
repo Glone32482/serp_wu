@@ -24,6 +24,7 @@ import traceback
 import asyncio
 import aiohttp
 import time
+from difflib import SequenceMatcher
 # --- Функция для унификации тире ---
 def unify_dashes(text: str) -> str:
     """Заменяет все длинные тире и похожие символы на обычный дефис"""
@@ -76,6 +77,11 @@ DEFAULT_LSI_TRUNC_MAX_REMOVE = 3
 DEFAULT_LSI_TRUNC_MIN_ORIG_LEN = 7
 DEFAULT_LSI_TRUNC_MIN_FINAL_LEN = 4
 DEFAULT_STEM_FUZZY_RATIO_THRESHOLD = 90
+# Порог схожести (%) для сравнения Title/Description в SEO Meta Checker —
+# та же логика, что в Tittle_Description+: %drug%/%min_price% в таблице
+# никогда не совпадут побайтово с реальным текстом на сайте, поэтому вместо
+# точного равенства строк считаем процент схожести после очистки от шаблонов.
+META_MATCH_THRESHOLD = 80
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -178,6 +184,25 @@ def analyze_texts(text1: str, text2: str) -> str:
     return "\n".join(result_markdown)
 
 # ========== НОВАЯ ВКЛАДКА: SEO Meta Checker ==========
+def clean_text(text: Optional[Any]) -> str:
+    """Убирает шаблонные %drug%/%min_price%, цену и фирменную подпись сайта перед
+    сравнением на схожесть. Та же функция, что используется во вкладке
+    Tittle_Description+ — вынесена на уровень модуля, чтобы её можно было
+    использовать и в SEO Meta Checker."""
+    text = str(text).lower()
+    text = re.sub(r'%min_price%', '', text)
+    text = re.sub(r'%drug%', '', text)
+    text = re.sub(r'(цена от|ціна від)\s*[^|\n\r\-,]+', '', text)
+    text = re.sub(r'(мис|міс)\s*аптека\s*9-1-1', '', text)
+    text = re.sub(r'[\-\|:,⭐⏩⚡🔹📦→®]', '', text)
+    text = re.sub(r'грн|uah', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def get_similarity(text1: str, text2: str) -> float:
+    """Процент схожести двух строк (0-100), используется вместе с clean_text()."""
+    return round(SequenceMatcher(None, text1, text2).ratio() * 100, 1)
+
 def normalize_for_search(text: Optional[Any]) -> str:
     """Улучшенная нормализация текста для поиска"""
     if not text or pd.isna(text):
@@ -190,13 +215,22 @@ def normalize_for_search(text: Optional[Any]) -> str:
     text = re.sub(r'<[^>]+>', ' ', text)
     
     # Удаляем цены и другие числовые значения
-    text = re.sub(r'(цена от|ціна від|price from)\s*[^-\|\n\r<–—]+?(\s*[-\|–—]|$)', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(от|від)\s*[^-\|\n\r<–—]+?(\s*[-\|–—]|$)', ' ', text, flags=re.IGNORECASE)
+    # Добавили запятую в список стоп-символов и границу \b после "от/від":
+    # раньше при отсутствии дефиса после цены (только запятая) регулярка не
+    # находила стоп-символ и съедала весь остаток текста до конца строки —
+    # из-за этого из текста страницы пропадали настоящие слова и фразы,
+    # которые потом не находились при поиске. "От/від" без \b после группы
+    # также ошибочно "открывал" слова "отзывы"/"відгуки" как начало цены.
+    text = re.sub(r'(цена от|ціна від|price from)\s*[^-\|,\n\r<–—]+?(\s*[-\|,–—]|$)', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(от|від)\b\s*(?=[\d%])[^-\|,\n\r<–—]+?(\s*[-\|,–—]|$)', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'%\s*[^%]+?\s*%', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'\d+(\.\d+)?\s*(грн|uah|usd|eur|₴)?', ' ', text, flags=re.IGNORECASE)
     
-    # Заменяем все не-буквенные символы на пробелы
-    text = re.sub(r'[^a-zа-яё0-9\s]', ' ', text, flags=re.IGNORECASE)
+    # Заменяем все не-буквенные символы на пробелы. Раньше здесь были только
+    # русские буквы (а-я) — украинские буквы і/ї/є/ґ считались "мусором" и
+    # вырезались (например, "відгуки" превращалось в "в дгуки"), из-за чего
+    # украинские слова калечились ещё до сравнения.
+    text = re.sub(r'[^a-zа-яёіїєґ0-9\s]', ' ', text, flags=re.IGNORECASE)
     
     # Заменяем множественные пробелы на один
     text = re.sub(r'\s+', ' ', text)
@@ -606,16 +640,24 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                 expected_desc = str(row_from_df.get(expected_desc_col, "")).strip()
                 site_title = page_lang_specific_data.get('title', "").strip()
                 site_desc = page_lang_specific_data.get('description', "").strip()
-                # Унифицируем тире перед сравнением
+                # Унифицируем тире, затем сравниваем так же, как во вкладке Tittle_Description+:
+                # чистим от шаблонных %drug%/%min_price%, цены и фирменной подписи сайта и считаем
+                # процент схожести. Точное совпадение строк здесь не подходит — шаблон из таблицы
+                # ("%drug% - ціна від %min_price%, ...") никогда не совпадёт побайтово с реальным
+                # резолвнутым текстом на сайте ("Дексаметазон - ...").
                 expected_title_unified = unify_dashes(expected_title)
                 expected_desc_unified = unify_dashes(expected_desc)
                 site_title_unified = unify_dashes(site_title)
                 site_desc_unified = unify_dashes(site_desc)
-                title_match = normalize_for_search(site_title_unified) == normalize_for_search(expected_title_unified) if expected_title else (not site_title)
-                desc_match = normalize_for_search(site_desc_unified) == normalize_for_search(expected_desc_unified) if expected_desc else (not site_desc)
-                item_details.update({'expected_title': expected_title, 'expected_desc': expected_desc, 'site_title': site_title, 'site_desc': site_desc, 'title_match': title_match, 'desc_match': desc_match})
-                if not title_match: tab1_errors_summary['title_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Title не совпадает')
-                if not desc_match: tab1_errors_summary['desc_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Desc не совпадает')
+                title_similarity = get_similarity(clean_text(expected_title_unified), clean_text(site_title_unified)) if expected_title else (100.0 if not site_title else 0.0)
+                desc_similarity = get_similarity(clean_text(expected_desc_unified), clean_text(site_desc_unified)) if expected_desc else (100.0 if not site_desc else 0.0)
+                title_match = title_similarity >= META_MATCH_THRESHOLD
+                desc_match = desc_similarity >= META_MATCH_THRESHOLD
+                item_details.update({'expected_title': expected_title, 'expected_desc': expected_desc, 'site_title': site_title, 'site_desc': site_desc,
+                                     'title_match': title_match, 'desc_match': desc_match,
+                                     'title_similarity': title_similarity, 'desc_similarity': desc_similarity})
+                if not title_match: tab1_errors_summary['title_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Title совпадает на {title_similarity}%')
+                if not desc_match: tab1_errors_summary['desc_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Desc совпадает на {desc_similarity}%')
             if item_details['has_issue']: urls_with_meta_issues_list_tab1.append(item_details['final_url'])
             tab1_processed_rows_data.append(item_details)
         st.info(f"Ошибок загрузки: {tab1_errors_summary['load_error']} | Несовп. Title: {tab1_errors_summary['title_mismatch']} | Несовп. Desc: {tab1_errors_summary['desc_mismatch']}")
@@ -627,10 +669,10 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
             with st.expander(exp_title, expanded=item_m['has_issue']):
                 if "Ошибка загрузки" in "".join(item_m['issue_details']): st.error(f"Не удалось получить данные. {item_m['issue_details'][0]}")
                 else:
-                    st.markdown(f"""<div class="info-box"><b>Title:</b> {'✅ Совпадает' if item_m['title_match'] else '❌ Не совпадает'}
+                    st.markdown(f"""<div class="info-box"><b>Title:</b> {'✅' if item_m['title_match'] else '❌'} Совпадение {item_m['title_similarity']}%
                                 <div class="result-content"><b>Ожидалось ({expected_title_col}):</b> {html.escape(str(item_m['expected_title']))}</div>
                                 <div class="result-content"><b>На сайте:</b> {html.escape(str(item_m['site_title']))}</div></div>
-                                <div class="info-box"><b>Description:</b> {'✅ Совпадает' if item_m['desc_match'] else '❌ Не совпадает'}
+                                <div class="info-box"><b>Description:</b> {'✅' if item_m['desc_match'] else '❌'} Совпадение {item_m['desc_similarity']}%
                                 <div class="result-content"><b>Ожидалось ({expected_desc_col}):</b> {html.escape(str(item_m['expected_desc']))}</div>
                                 <div class="result-content"><b>На сайте:</b> {html.escape(str(item_m['site_desc']))}</div></div>""", unsafe_allow_html=True)
     with sub_tab_phrases:
@@ -1599,8 +1641,10 @@ def main():
     elif tab == "🔍 SEO Meta Checker":
         st.title("SEO Meta Checker для Apteka911")
         show_tab_help(
-            "загружает каждую страницу сайта на RU и UA, сравнивает Title/Description с эталоном "
-            "и ищет точные и LSI-фразы в тексте страницы (с лемматизацией и нечётким сравнением).",
+            f"загружает каждую страницу сайта на RU и UA, сравнивает Title/Description с эталоном "
+            f"(с учётом шаблонных %drug%/%min_price% — считается процент схожести, совпадением "
+            f"считается {META_MATCH_THRESHOLD}% и выше) и ищет точные и LSI-фразы в тексте страницы "
+            f"(с лемматизацией и нечётким сравнением).",
             columns="Обязательно: `URL`, `Title RU`, `Description RU`. Необязательно: `Title UA`, "
                     "`Description UA` (если нет — используется RU-версия), `Фразы в точном вхождении RU`/`UA`, "
                     "`LSI`/`LSI UA`."
