@@ -203,6 +203,46 @@ def get_similarity(text1: str, text2: str) -> float:
     """Процент схожести двух строк (0-100), используется вместе с clean_text()."""
     return round(SequenceMatcher(None, text1, text2).ratio() * 100, 1)
 
+def _template_regex_from(template: str):
+    """Строит regex из строки-шаблона, где %любой_текст% (например %drug%,
+    %min_price%) — это wildcard: на сайте вместо него стоит реальное
+    значение (название товара, цена и т.п.), а не сам плейсхолдер.
+    Пробелы между литералами матчим через \\s+ (гибко к лишним/недостающим
+    пробелам) — экранируем каждый непробельный кусок ОТДЕЛЬНО от пробелов,
+    иначе re.escape() в Python 3.11 сам экранирует пробел обратным слэшем
+    и вместе с нашим \\s+ получается битый \\\\s+ (двойной слэш)."""
+    segments = re.split(r'%[^%]+%', template)
+    parts = []
+    for seg in segments:
+        tokens = re.split(r'(\s+)', seg)
+        piece = ''.join(r'\s+' if t.isspace() else re.escape(t) for t in tokens)
+        parts.append(piece)
+    pattern = '.*?'.join(parts)
+    return re.compile(r'^\s*' + pattern + r'\s*.*$', re.IGNORECASE | re.DOTALL)
+
+def text_matches_template(expected: str, actual: str) -> bool:
+    """Сравнивает ожидаемый текст с реальным текстом на сайте.
+    Если expected содержит %...%-плейсхолдеры — они трактуются как wildcard
+    (совпадёт с любым резолвнутым значением), а не как текст для точного
+    совпадения после удаления. Раньше сравнение шло через удаление
+    плейсхолдера и подсчёт % схожести — но название товара внутри %drug%
+    всегда «отъедало» несколько процентов, и реальные совпадающие строки
+    (например, "%drug% - цена от %min_price%, ..." против
+    "Дексаметазон - цена от 32.50 грн, ...") оказывались чуть ниже порога
+    и ошибочно помечались как несовпадающие.
+    Если плейсхолдеров нет — используется прежняя логика (очистка + % схожести),
+    так как для обычного текста именно небольшие отличия важно ловить."""
+    expected_s = (expected or "").strip()
+    actual_s = (actual or "").strip()
+    if not expected_s:
+        return not actual_s
+    if '%' in expected_s:
+        try:
+            return bool(_template_regex_from(expected_s).match(actual_s))
+        except re.error:
+            pass
+    return get_similarity(clean_text(expected_s), clean_text(actual_s)) >= META_MATCH_THRESHOLD
+
 def normalize_for_search(text: Optional[Any]) -> str:
     """Улучшенная нормализация текста для поиска"""
     if not text or pd.isna(text):
@@ -618,6 +658,16 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
     else:
         expected_title_col = COL_TITLE_RU_EXCEL; expected_desc_col = COL_DESC_RU_EXCEL
         exact_phrases_col = COL_EXACT_PHRASES_RU_EXCEL; lsi_col = COL_LSI_RU_EXCEL
+        # Некоторые файлы называют RU-колонку с точными фразами без суффикса "RU"
+        # (просто "Фразы в точном вхождении") — суффикс ставят только у UA-варианта.
+        # Раньше из-за этого несовпадения имени колонка считалась отсутствующей,
+        # и вкладка "Проверка фраз" всегда показывала "Нет данных" для RU.
+        if exact_phrases_col not in df_excel.columns:
+            bare_exact_phrases_col = 'Фразы в точном вхождении'
+            if bare_exact_phrases_col in df_excel.columns:
+                if debug_mode and 'debug_messages' in st.session_state:
+                    st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ (RU): Кол. '{exact_phrases_col}' нет, использую '{bare_exact_phrases_col}'.")
+                exact_phrases_col = bare_exact_phrases_col
     required_cols_for_run = [COL_URL_RU_EXCEL, expected_title_col, expected_desc_col]
     missing_cols_in_df = [col for col in required_cols_for_run if col not in df_excel.columns]
     if missing_cols_in_df:
@@ -651,8 +701,12 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                 site_desc_unified = unify_dashes(site_desc)
                 title_similarity = get_similarity(clean_text(expected_title_unified), clean_text(site_title_unified)) if expected_title else (100.0 if not site_title else 0.0)
                 desc_similarity = get_similarity(clean_text(expected_desc_unified), clean_text(site_desc_unified)) if expected_desc else (100.0 if not site_desc else 0.0)
-                title_match = title_similarity >= META_MATCH_THRESHOLD
-                desc_match = desc_similarity >= META_MATCH_THRESHOLD
+                # Сам вердикт "совпадает/не совпадает" — через wildcard-сравнение
+                # шаблона (%drug%/%min_price% совпадают с любым резолвнутым
+                # значением), а не через фиксированный порог % схожести.
+                # Процент (similarity) оставляем только для отображения в UI.
+                title_match = text_matches_template(expected_title_unified, site_title_unified)
+                desc_match = text_matches_template(expected_desc_unified, site_desc_unified)
                 item_details.update({'expected_title': expected_title, 'expected_desc': expected_desc, 'site_title': site_title, 'site_desc': site_desc,
                                      'title_match': title_match, 'desc_match': desc_match,
                                      'title_similarity': title_similarity, 'desc_similarity': desc_similarity})
