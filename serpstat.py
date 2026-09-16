@@ -1151,7 +1151,22 @@ def pharmacy_image_url_checker_tab():
                             final_cols = [col for col in cols_order if col in results_df.columns]
                             results_df_display = results_df[final_cols]
                             st.markdown("---"); st.subheader("📊 Результаты проверки")
-                            st.dataframe(results_df_display)
+                            if "Результат" in results_df_display.columns:
+                                unique_statuses = sorted(results_df_display["Результат"].dropna().unique().tolist())
+                                selected_statuses = st.multiselect(
+                                    "Фильтр по результату:",
+                                    options=unique_statuses, default=unique_statuses,
+                                    key="pharmacy_status_filter"
+                                )
+                                results_df_filtered_for_display = results_df_display[
+                                    results_df_display["Результат"].isin(selected_statuses)
+                                ]
+                            else:
+                                results_df_filtered_for_display = results_df_display
+                            st.caption(f"Показано {len(results_df_filtered_for_display)} из {len(results_df_display)} записей.")
+                            # Ограничиваем высоту таблицы, чтобы большой отчёт не растягивал страницу на тысячи пикселей.
+                            table_height = min(600, 35 * (len(results_df_filtered_for_display) + 1) + 3)
+                            st.dataframe(results_df_filtered_for_display, height=table_height, use_container_width=True)
                             output_excel = BytesIO()
                             with pd.ExcelWriter(output_excel, engine='xlsxwriter') as writer:
                                 results_df_display.to_excel(writer, index=False, sheet_name='Результаты_проверки_URL')
