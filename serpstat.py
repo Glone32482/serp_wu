@@ -486,80 +486,35 @@ def check_lsi_phrases(raw_page_text: str, phrases_input: Optional[Any], debug_mo
     
     return results
 
-@st.cache_data(ttl=3600)
-def get_page_data_for_lang(base_ru_url: str, lang_to_fetch: str, debug_mode_internal: bool = False,
-                           save_html_for_debug_manual: bool = False, filename_prefix_manual: str = "manual_debug_page") -> Dict[str, Any]:
-    if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'ru-RU,ru;q=1.0,uk;q=0.8,en-US;q=0.6,en;q=0.4' if lang_to_fetch == 'ru' else 'uk-UA,uk;q=1.0,ru;q=0.8,en-US;q=0.6,en;q=0.4',
-        'Connection': 'keep-alive', 'Upgrade-Insecure-Requests': '1', 'DNT': '1', 'Sec-GPC': '1',
-    }
-    session.cookies.set('language', lang_to_fetch, domain='apteka911.ua')
-    session.cookies.set('lang', lang_to_fetch, domain='apteka911.ua')
-
+def _build_lang_url(base_ru_url: str, lang_to_fetch: str) -> str:
+    """Строит URL страницы сайта для нужного языка (ru/ua) из базового RU-URL,
+    учитывая query-параметры и уже имеющийся префикс 'ua/'. Общая функция для
+    синхронной и асинхронной загрузки страниц здесь и для перевода URL на UA
+    во вкладке Tittle_Description+ (там раньше это делала наивная замена
+    строки 'apteka911.ua/' -> 'apteka911.ua/ua/', не учитывающая query и
+    случай, когда 'ua/' уже стоит в исходном URL)."""
     parsed_original_url = urlparse(base_ru_url)
     original_path = parsed_original_url.path.lstrip('/')
     original_query = parsed_original_url.query
-
-    base_path = original_path
-    if base_path.startswith('ua/'):
-        base_path = base_path[3:]
-
-    if lang_to_fetch == 'ua':
-        final_path_processed = f"ua/{base_path}"
-    else:
-        final_path_processed = base_path
-
+    base_path = original_path[3:] if original_path.startswith('ua/') else original_path
+    final_path_processed = f"ua/{base_path}" if lang_to_fetch == 'ua' else base_path
     base_modified_url = urljoin(BASE_URL_SITE, final_path_processed)
-    modified_url_with_query = base_modified_url
-    if original_query:
-        if not base_modified_url.endswith('?'):
-            modified_url_with_query = f"{base_modified_url}?{original_query}"
-        else:
-            modified_url_with_query = f"{base_modified_url}{original_query}"
+    if not original_query:
+        return base_modified_url
+    sep = '' if base_modified_url.endswith('?') else '?'
+    return f"{base_modified_url}{sep}{original_query}"
 
-    if debug_mode_internal:
-        st.session_state.debug_messages.append(f"--- Отладка для URL: {base_ru_url} (язык: {lang_to_fetch}) ---")
-        st.session_state.debug_messages.append(f"Исходный URL (base): '{base_ru_url}'")
-        st.session_state.debug_messages.append(f"Определен базовый путь: '{base_path}'")
-        st.session_state.debug_messages.append(f"Собран финальный URL для запроса: '{modified_url_with_query}'")
-
-    page_title, page_desc, page_full_text, error_message = "", "", "", None
-    final_url_after_redirects = modified_url_with_query
-
-    try:
-        response = session.get(modified_url_with_query, headers=headers, timeout=20, verify=False, allow_redirects=True)
-        response.raise_for_status()
-        final_url_after_redirects = response.url
-        if debug_mode_internal: st.session_state.debug_messages.append(f"[HTTP RESPONSE] Final URL: '{final_url_after_redirects}', Status: {response.status_code}, Apparent Encoding: {response.apparent_encoding}")
-
-        response.encoding = 'utf-8'
-        html_content = response.text
-
-        if save_html_for_debug_manual:
-            try:
-                path_part = "".join(c if c.isalnum() else "_" for c in urlparse(final_url_after_redirects).path)
-                safe_path_part = path_part.replace("__", "_")[:50]
-                debug_html_filename = f"{filename_prefix_manual}_{lang_to_fetch}_{safe_path_part}.html"
-                with open(debug_html_filename, "w", encoding="utf-8") as f: f.write(html_content)
-                if debug_mode_internal: st.session_state.debug_messages.append(f"ОТЛАДКА (ручная): HTML для {final_url_after_redirects} сохранен в: {debug_html_filename}")
-            except Exception as e_save:
-                if debug_mode_internal: st.session_state.debug_messages.append(f"ОШИБКА РУЧНОГО СОХРАНЕНИЯ HTML: {str(e_save)}")
-
-    except requests.exceptions.RequestException as e:
-        error_message = f"Ошибка запроса к {modified_url_with_query}: {str(e)}"
-        if debug_mode_internal: st.session_state.debug_messages.append(f"[REQUEST ERROR] URL: {modified_url_with_query}, Error: {error_message}")
-        return {'title': '', 'description': '', 'full_text': '', 'error': error_message, 'final_url_fetched': modified_url_with_query}
-
+def _extract_page_content(html_content: str, final_url_after_redirects: str = "", debug_mode_internal: bool = False) -> Dict[str, str]:
+    """Разбор HTML в Title/Description/текст страницы — общая логика для
+    синхронной (ручная отладка одного URL) и асинхронной (массовая проверка)
+    загрузки, чтобы не дублировать парсинг в двух местах."""
     soup = BeautifulSoup(html_content, 'html.parser')
     title_tag = soup.find('title')
     description_tag = soup.find('meta', attrs={'name': 'description'})
     page_title = title_tag.text.strip() if title_tag else ''
     page_desc = description_tag['content'].strip() if description_tag and description_tag.get('content') else ''
 
-    if debug_mode_internal:
+    if debug_mode_internal and 'debug_messages' in st.session_state:
         st.session_state.debug_messages.append(f"[META EXTRACTED] Из URL: '{final_url_after_redirects}', Title Found: {'Да' if page_title else 'Нет'}, Title: '{page_title[:150]}...'")
         st.session_state.debug_messages.append(f"[META EXTRACTED] Из URL: '{final_url_after_redirects}', Desc Found: {'Да' if page_desc else 'Нет'}, Desc: '{page_desc[:150]}...'")
 
@@ -599,34 +554,139 @@ def get_page_data_for_lang(base_ru_url: str, lang_to_fetch: str, debug_mode_inte
     if debug_mode_internal and 'debug_messages' in st.session_state:
         st.session_state.debug_messages.append(f"[CONTENT SAMPLE for {final_url_after_redirects}] '{content[:300]}...' (Всего символов: {len(content)})")
     page_full_text = f"{page_title} {page_desc} {content}"
-    return {'title': page_title, 'description': page_desc, 'full_text': page_full_text, 'error': error_message, 'final_url_fetched': final_url_after_redirects}
+    return {'title': page_title, 'description': page_desc, 'full_text': page_full_text}
 
-@st.cache_data
-def load_all_pages_data_for_both_langs(dataframe: pd.DataFrame, _debug_mode_global: bool) -> Dict[str, Dict[str, Dict[str, Any]]]:
+@st.cache_data(ttl=3600)
+def get_page_data_for_lang(base_ru_url: str, lang_to_fetch: str, debug_mode_internal: bool = False,
+                           save_html_for_debug_manual: bool = False, filename_prefix_manual: str = "manual_debug_page") -> Dict[str, Any]:
+    if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'ru-RU,ru;q=1.0,uk;q=0.8,en-US;q=0.6,en;q=0.4' if lang_to_fetch == 'ru' else 'uk-UA,uk;q=1.0,ru;q=0.8,en-US;q=0.6,en;q=0.4',
+        'Connection': 'keep-alive', 'Upgrade-Insecure-Requests': '1', 'DNT': '1', 'Sec-GPC': '1',
+    }
+    session.cookies.set('language', lang_to_fetch, domain='apteka911.ua')
+    session.cookies.set('lang', lang_to_fetch, domain='apteka911.ua')
+
+    modified_url_with_query = _build_lang_url(base_ru_url, lang_to_fetch)
+    base_path = urlparse(base_ru_url).path.lstrip('/')
+    if base_path.startswith('ua/'): base_path = base_path[3:]
+
+    if debug_mode_internal:
+        st.session_state.debug_messages.append(f"--- Отладка для URL: {base_ru_url} (язык: {lang_to_fetch}) ---")
+        st.session_state.debug_messages.append(f"Исходный URL (base): '{base_ru_url}'")
+        st.session_state.debug_messages.append(f"Определен базовый путь: '{base_path}'")
+        st.session_state.debug_messages.append(f"Собран финальный URL для запроса: '{modified_url_with_query}'")
+
+    page_title, page_desc, page_full_text, error_message = "", "", "", None
+    final_url_after_redirects = modified_url_with_query
+
+    try:
+        response = session.get(modified_url_with_query, headers=headers, timeout=20, verify=False, allow_redirects=True)
+        response.raise_for_status()
+        final_url_after_redirects = response.url
+        if debug_mode_internal: st.session_state.debug_messages.append(f"[HTTP RESPONSE] Final URL: '{final_url_after_redirects}', Status: {response.status_code}, Apparent Encoding: {response.apparent_encoding}")
+
+        response.encoding = 'utf-8'
+        html_content = response.text
+
+        if save_html_for_debug_manual:
+            try:
+                path_part = "".join(c if c.isalnum() else "_" for c in urlparse(final_url_after_redirects).path)
+                safe_path_part = path_part.replace("__", "_")[:50]
+                debug_html_filename = f"{filename_prefix_manual}_{lang_to_fetch}_{safe_path_part}.html"
+                with open(debug_html_filename, "w", encoding="utf-8") as f: f.write(html_content)
+                if debug_mode_internal: st.session_state.debug_messages.append(f"ОТЛАДКА (ручная): HTML для {final_url_after_redirects} сохранен в: {debug_html_filename}")
+            except Exception as e_save:
+                if debug_mode_internal: st.session_state.debug_messages.append(f"ОШИБКА РУЧНОГО СОХРАНЕНИЯ HTML: {str(e_save)}")
+
+    except requests.exceptions.RequestException as e:
+        error_message = f"Ошибка запроса к {modified_url_with_query}: {str(e)}"
+        if debug_mode_internal: st.session_state.debug_messages.append(f"[REQUEST ERROR] URL: {modified_url_with_query}, Error: {error_message}")
+        return {'title': '', 'description': '', 'full_text': '', 'error': error_message, 'final_url_fetched': modified_url_with_query}
+
+    extracted = _extract_page_content(html_content, final_url_after_redirects, debug_mode_internal)
+    return {**extracted, 'error': error_message, 'final_url_fetched': final_url_after_redirects}
+
+async def _fetch_page_data_async(http_session: "aiohttp.ClientSession", semaphore: asyncio.Semaphore,
+                                  base_ru_url: str, lang_to_fetch: str) -> Dict[str, Any]:
+    """Асинхронный аналог get_page_data_for_lang для массовой загрузки —
+    та же логика построения URL и разбора HTML (через общие _build_lang_url()
+    и _extract_page_content()), но через aiohttp и под семафором, как во
+    вкладке проверки картинок аптек, вместо последовательных requests.get()."""
+    async with semaphore:
+        headers = {
+            'User-Agent': DEFAULT_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'ru-RU,ru;q=1.0,uk;q=0.8,en-US;q=0.6,en;q=0.4' if lang_to_fetch == 'ru' else 'uk-UA,uk;q=1.0,ru;q=0.8,en-US;q=0.6,en;q=0.4',
+        }
+        # Куки языка передаём per-request, а не через общий session/cookie jar —
+        # общий cookie jar на несколько одновременных запросов (RU и UA параллельно,
+        # плюс несколько пользователей Streamlit Cloud в одном процессе) мог бы
+        # "перетереть" язык одного запроса языком другого.
+        cookies = {'language': lang_to_fetch, 'lang': lang_to_fetch}
+        modified_url_with_query = _build_lang_url(base_ru_url, lang_to_fetch)
+        result = {'_source_url': base_ru_url, '_lang': lang_to_fetch, 'title': '', 'description': '',
+                  'full_text': '', 'error': None, 'final_url_fetched': modified_url_with_query}
+        try:
+            async with http_session.get(modified_url_with_query, headers=headers, cookies=cookies,
+                                         timeout=aiohttp.ClientTimeout(total=20), ssl=False,
+                                         allow_redirects=True) as response:
+                response.raise_for_status()
+                final_url_after_redirects = str(response.url)
+                raw_bytes = await response.read()
+                html_content = raw_bytes.decode('utf-8', errors='ignore')
+        except Exception as e:
+            result['error'] = f"Ошибка запроса к {modified_url_with_query}: {e}"
+            return result
+        result.update(_extract_page_content(html_content, final_url_after_redirects))
+        result['final_url_fetched'] = final_url_after_redirects
+        return result
+
+async def _load_all_pages_data_for_both_langs_async(dataframe: pd.DataFrame, max_concurrent: int,
+                                                      progress_bar_ui=None, status_text_ui=None) -> Dict[str, Dict[str, Dict[str, Any]]]:
     all_data = {}
-    total_rows = len(dataframe)
-    if 'global_progress_text' not in st.session_state: st.session_state.global_progress_text = ""
-    if 'global_progress_value' not in st.session_state: st.session_state.global_progress_value = 0.0
-    for i, row in dataframe.iterrows():
-        base_ru_url = str(row[COL_URL_RU_EXCEL])
-        all_data[base_ru_url] = {}
-        for lang_idx, lang_code in enumerate(['ru', 'ua']):
-            current_op_total = (i * 2) + (lang_idx + 1)
-            total_ops_overall = total_rows * 2
-            st.session_state.global_progress_text = f"Загрузка: {current_op_total}/{total_ops_overall} ({base_ru_url} - {lang_code.upper()})"
-            st.session_state.global_progress_value = current_op_total / total_ops_overall
-            if _debug_mode_global: print(st.session_state.global_progress_text)
-            manual_debug_url_val = st.session_state.get("manual_debug_url_val", None)
-            manual_debug_lang_val = st.session_state.get("manual_debug_lang_val", None)
-            save_html_this_iteration = _debug_mode_global and base_ru_url == manual_debug_url_val and lang_code == manual_debug_lang_val
-            all_data[base_ru_url][lang_code] = get_page_data_for_lang(base_ru_url, lang_code,
-                                                                      debug_mode_internal=_debug_mode_global,
-                                                                      save_html_for_debug_manual=save_html_this_iteration,
-                                                                      filename_prefix_manual="auto_save_on_load")
-    st.session_state.global_progress_text = "Загрузка данных завершена!"
-    st.session_state.global_progress_value = 1.0
-    if _debug_mode_global: print(st.session_state.global_progress_text)
+    unique_urls = []
+    seen = set()
+    skipped = 0
+    for _, row in dataframe.iterrows():
+        u = str(row[COL_URL_RU_EXCEL]).strip()
+        if not u or u.lower() in ('nan', 'none'):
+            skipped += 1
+            continue
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+        all_data.setdefault(u, {})
+    if not unique_urls:
+        return all_data
+    semaphore = asyncio.Semaphore(max_concurrent)
+    connector = aiohttp.TCPConnector(ssl=False, limit=max_concurrent)
+    async with aiohttp.ClientSession(connector=connector) as http_session:
+        tasks = [_fetch_page_data_async(http_session, semaphore, u, lang) for u in unique_urls for lang in ('ru', 'ua')]
+        total = len(tasks)
+        completed = 0
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            completed += 1
+            if progress_bar_ui: progress_bar_ui.progress(completed / total)
+            if status_text_ui: status_text_ui.text(f"Загрузка: {completed}/{total} ({res['_source_url']} - {res['_lang'].upper()})")
+            all_data[res['_source_url']][res['_lang']] = res
     return all_data
+
+def load_all_pages_data_for_both_langs(dataframe: pd.DataFrame, max_concurrent: int = 8,
+                                        progress_bar_ui=None, status_text_ui=None) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Синхронная обёртка: грузит RU и UA версии всех URL параллельно через
+    aiohttp+семафор (как во вкладке проверки картинок аптек) вместо
+    последовательных запросов по одному — на файле в сотню с лишним URL это
+    сотни последовательных запросов, легко уходящие за 30+ минут синхронно.
+    Раньше эта функция была задекорирована @st.cache_data БЕЗ ttl: повторный
+    прогон того же файла навсегда показывал бы данные первого прогона без
+    перезапуска приложения. Явного кэша здесь больше нет — вызов и так стоит
+    за кнопкой «Начать проверку», отдельное кэширование было лишним и было
+    источником этого бага."""
+    return asyncio.run(_load_all_pages_data_for_both_langs_async(dataframe, max_concurrent, progress_bar_ui, status_text_ui))
 
 def display_debug_messages():
     if 'debug_messages' in st.session_state and st.session_state.debug_messages:
@@ -1863,11 +1923,32 @@ def main():
         # новой таблицы — выглядело как баг, а не как подсказка "нажмите кнопку".
         current_file_signature = (uploaded_file.name, uploaded_file.size) if uploaded_file else None
 
-        if uploaded_file and st.button("🚀 Начать проверку всех URL из файла", key="start_full_processing_btn"):
+        df_excel_preview = None
+        if uploaded_file:
+            try:
+                df_excel_preview = pd.read_excel(uploaded_file)
+            except pd.errors.EmptyDataError:
+                st.error("Ошибка: Excel файл пуст.")
+            except Exception as e_preview:
+                st.error(f"Не удалось прочитать Excel-файл: {e_preview}")
+
+        max_concurrent_meta = st.slider(
+            "Количество параллельных запросов к сайту:", min_value=1, max_value=20, value=8,
+            help="Больше — быстрее, но выше риск отказов/капчи от сайта при слишком высокой нагрузке.",
+            key="meta_checker_max_concurrent"
+        )
+        if df_excel_preview is not None:
+            n_urls_preview = len(df_excel_preview)
+            n_requests_preview = n_urls_preview * 2
+            est_minutes = max(1, round(n_requests_preview / max_concurrent_meta * 1.5 / 60))
+            st.caption(f"≈ {n_urls_preview} URL × 2 языка (RU+UA) = {n_requests_preview} запросов сайту. "
+                       f"Очень приблизительная оценка времени: ~{est_minutes} мин.")
+
+        if uploaded_file and df_excel_preview is not None and st.button("🚀 Начать проверку всех URL из файла", key="start_full_processing_btn"):
             st.session_state.debug_messages = []
             df_excel = None
             try:
-                df_excel = pd.read_excel(uploaded_file)
+                df_excel = df_excel_preview
                 st.subheader(f"Проверка содержимого файла: '{uploaded_file.name}'")
                 st.markdown(f"Всего строк в файле: **{len(df_excel)}**. Первые 5 строк:")
                 st.dataframe(df_excel.head())
@@ -1886,15 +1967,15 @@ def main():
 
                 load_progress_bar_ui = st.progress(0.0)
                 load_progress_text_ui = st.empty()
-                st.session_state.global_progress_text = "Инициализация загрузки..."
-                st.session_state.global_progress_value = 0.0
-                load_progress_text_ui.info(st.session_state.global_progress_text)
+                load_progress_text_ui.info("Инициализация загрузки...")
 
-                st.session_state.processed_data = load_all_pages_data_for_both_langs(df_excel, debug_mode)
+                st.session_state.processed_data = load_all_pages_data_for_both_langs(
+                    df_excel, max_concurrent_meta, load_progress_bar_ui, load_progress_text_ui
+                )
                 st.session_state.processed_data_source = current_file_signature
 
-                load_progress_text_ui.success(st.session_state.get('global_progress_text', "Загрузка данных завершена!"))
-                load_progress_bar_ui.progress(st.session_state.get('global_progress_value', 1.0))
+                load_progress_text_ui.success("Загрузка данных завершена!")
+                load_progress_bar_ui.progress(1.0)
 
                 urls_total_count = len(df_excel)
                 urls_load_errors_count_ru = sum(1 for data_dict in st.session_state.processed_data.values() if data_dict.get('ru', {}).get('error'))
