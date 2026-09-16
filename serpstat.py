@@ -1188,12 +1188,36 @@ def pharmacy_image_url_checker_tab():
 
 # ========== ОСНОВНАЯ ЛОГИКА ==========
 def main():
+    # Единый визуальный стиль для кнопок и уведомлений во всех вкладках
+    # (не трогает внутреннюю вёрстку вкладок вроде Tittle_Description+, только добавляет общий штрих).
+    st.markdown("""
+    <style>
+        div[data-testid="stButton"] > button {
+            border-radius: 8px;
+        }
+        div[data-testid="stAlert"] {
+            border-radius: 8px;
+        }
+        div[data-testid="stDownloadButton"] > button {
+            border-radius: 8px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
     # --- Add company logo to sidebar ---
     import os
     logo_path = os.path.join(os.path.dirname(__file__), "WU.png")
     if os.path.exists(logo_path):
         st.sidebar.image(logo_path, width=120)
     st.sidebar.title("🌟 Инструменты SEO-комбайна")
+    if st.sidebar.button(
+        "🔄 Сбросить всё",
+        help="Очищает загруженные файлы и результаты проверок во всех вкладках и возвращает приложение к чистому состоянию",
+        key="global_reset_button"
+    ):
+        st.session_state.clear()
+        st.rerun()
+    st.sidebar.markdown("---")
     tab = st.sidebar.radio(
         "Выбери инструмент:",
         [
