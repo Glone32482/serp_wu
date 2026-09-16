@@ -1427,7 +1427,6 @@ def main():
 
     # ========== ВКЛАДКА 5: SEO Мета-Проверка 2.0 ==========
     if tab == "🧪 Tittle_Description +":
-        import tempfile
         import altair as alt
         from difflib import SequenceMatcher
 
@@ -1520,20 +1519,27 @@ def main():
         def get_similarity(text1, text2):
             return round(SequenceMatcher(None, text1, text2).ratio() * 100, 1)
 
-        def get_meta_from_url(url):
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                response = requests.get(url, headers=headers, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, 'html.parser')
-                title = soup.title.string.strip() if soup.title else ''
-                description = ''
-                tag = soup.find("meta", attrs={"name": "description"})
-                if tag and tag.get("content"):
-                    description = tag["content"].strip()
-                return title, description
-            except requests.exceptions.RequestException as e:
-                return f'[ошибка загрузки: {e}]', ''
+        def get_meta_from_url(url, max_retries=2):
+            # Ретраи: сайт иногда отдаёт временный таймаут/500 под нагрузкой,
+            # раньше одна такая ошибка сразу помечала URL как "не совпадает".
+            last_error = None
+            for attempt in range(max_retries + 1):
+                try:
+                    headers = {'User-Agent': DEFAULT_USER_AGENT}
+                    response = requests.get(url, headers=headers, timeout=10)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    title = soup.title.string.strip() if soup.title else ''
+                    description = ''
+                    tag = soup.find("meta", attrs={"name": "description"})
+                    if tag and tag.get("content"):
+                        description = tag["content"].strip()
+                    return title, description
+                except requests.exceptions.RequestException as e:
+                    last_error = e
+                    if attempt < max_retries:
+                        time.sleep(1)
+            return f'[ошибка загрузки: {last_error}]', ''
 
         tabs2 = st.tabs(["Загрузка", "Результаты"])
 
@@ -1550,76 +1556,121 @@ def main():
             uploaded_file = st.file_uploader("Загрузите Excel-файл с данными:", type=["xlsx"], key="meta2_file")
             if 'meta2_result_df' not in st.session_state:
                 st.session_state.meta2_result_df = None
+            if 'meta2_data_source' not in st.session_state:
+                st.session_state.meta2_data_source = None
 
+            # Сигнатура текущего файла хранится в session_state, чтобы вкладка
+            # "Результаты" могла предупредить, если результаты устарели.
+            current_meta2_signature = (uploaded_file.name, uploaded_file.size) if uploaded_file else None
+            st.session_state.meta2_current_signature = current_meta2_signature
+
+            df_meta2_preview = None
             if uploaded_file:
-                df = pd.read_excel(uploaded_file)
-                df.columns = df.columns.str.strip()
-                url_col = next((c for c in df.columns if str(c).strip().lower() == 'url'), None)
+                try:
+                    df_meta2_preview = pd.read_excel(uploaded_file)
+                    df_meta2_preview.columns = df_meta2_preview.columns.str.strip()
+                except Exception as e_read:
+                    st.error(f"Не удалось прочитать Excel-файл: {e_read}")
+
+            if df_meta2_preview is not None:
+                url_col = next((c for c in df_meta2_preview.columns if str(c).strip().lower() == 'url'), None)
                 if url_col is None:
                     st.error(
                         "В файле не найдена колонка **URL**. "
-                        f"Найденные колонки: {', '.join(map(str, df.columns))}"
+                        f"Найденные колонки: {', '.join(map(str, df_meta2_preview.columns))}"
                     )
-                    st.stop()
-                if url_col != 'URL':
-                    df = df.rename(columns={url_col: 'URL'})
-                st.success("Файл загружен успешно. Начинаю проверку...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                results = []
-                total = len(df)
-                for index, row in df.iterrows():
-                    progress = (index + 1) / total
-                    progress_bar.progress(progress)
-                    status_text.text(f"Проверено {index + 1}/{total} URL")
-                    url = str(row['URL']).strip()
-                    url_ua = url.replace("apteka911.ua/", "apteka911.ua/ua/")
-                    row_result = {
-                        'URL': url,
-                        'Title RU (таблица)': row.get('Title RU', ''),
-                        'Description RU (таблица)': row.get('Description RU', ''),
-                        'Title UA (таблица)': row.get('Title UA', ''),
-                        'Description UA (таблица)': row.get('Description UA', '')
-                    }
-                    # RU
-                    title_ru_site, desc_ru_site = get_meta_from_url(url)
-                    row_result['Title RU (сайт)'] = title_ru_site
-                    row_result['Description RU (сайт)'] = desc_ru_site
-                    # UA
-                    title_ua_site, desc_ua_site = get_meta_from_url(url_ua)
-                    row_result['Title UA (сайт)'] = title_ua_site
-                    row_result['Description UA (сайт)'] = desc_ua_site
-                    # Сходство
-                    title_ru_sim = get_similarity(clean_text(row.get('Title RU', '')), clean_text(title_ru_site))
-                    desc_ru_sim = get_similarity(clean_text(row.get('Description RU', '')), clean_text(desc_ru_site))
-                    title_ua_sim = get_similarity(clean_text(row.get('Title UA', '')), clean_text(title_ua_site))
-                    desc_ua_sim = get_similarity(clean_text(row.get('Description UA', '')), clean_text(desc_ua_site))
-                    row_result['Title RU Совпадение (%)'] = title_ru_sim
-                    row_result['Description RU Совпадение (%)'] = desc_ru_sim
-                    row_result['Title UA Совпадение (%)'] = title_ua_sim
-                    row_result['Description UA Совпадение (%)'] = desc_ua_sim
-                    results.append(row_result)
-                status_text.text("Проверка завершена!")
-                result_df = pd.DataFrame(results)
-                st.session_state.meta2_result_df = result_df
-                def highlight_percentage(p):
-                    if p >= 80:
-                        return f"✅ {p}%"
-                    elif p >= 50:
-                        return f"🟡 {p}%"
-                    else:
-                        return f"❌ {p}%"
-                display_df = result_df.copy()
-                for col in display_df.columns:
-                    if "Совпадение" in col:
-                        display_df[col] = display_df[col].apply(highlight_percentage)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-                    result_df.to_excel(tmp.name, index=False)
-                    st.download_button("📥 Скачать результат", data=open(tmp.name, "rb"), file_name="seo_meta_check_result.xlsx")
+                else:
+                    if url_col != 'URL':
+                        df_meta2_preview = df_meta2_preview.rename(columns={url_col: 'URL'})
+                    all_urls_stripped = df_meta2_preview['URL'].astype(str).str.strip()
+                    n_rows = len(df_meta2_preview)
+                    n_unique = all_urls_stripped[~all_urls_stripped.str.lower().isin(['', 'nan', 'none'])].nunique()
+                    st.caption(
+                        f"Найдено строк: {n_rows}, уникальных URL: {n_unique} "
+                        f"(каждый URL проверяется только один раз, даже если он встречается в таблице несколько раз)."
+                    )
+                    start_check = st.button("🚀 Начать проверку", key="meta2_start_btn")
+
+                    if start_check:
+                        with st.spinner("Проверяем URL..."):
+                            df = df_meta2_preview
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+
+                            # Собираем уникальные URL, чтобы не запрашивать один и тот же
+                            # адрес несколько раз, если он повторяется в таблице,
+                            # и пропускаем пустые/"nan" URL вместо того чтобы делать по ним бесполезный запрос.
+                            unique_urls = []
+                            seen_urls = set()
+                            for u in all_urls_stripped:
+                                if u and u.lower() not in ('nan', 'none') and u not in seen_urls:
+                                    seen_urls.add(u)
+                                    unique_urls.append(u)
+
+                            site_cache: Dict[str, Tuple[str, str, str, str]] = {}
+                            total_unique = len(unique_urls)
+                            for idx, url in enumerate(unique_urls):
+                                progress_bar.progress((idx + 1) / total_unique if total_unique else 1.0)
+                                status_text.text(f"Проверено {idx + 1}/{total_unique} уникальных URL")
+                                # Строим UA-версию URL тем же хелпером, что и в SEO Meta Checker
+                                # (_build_lang_url), а не наивной заменой подстроки —
+                                # та ломалась на URL с query-параметрами и на уже UA-URL.
+                                url_ua = _build_lang_url(url, 'ua')
+                                title_ru_site, desc_ru_site = get_meta_from_url(url)
+                                title_ua_site, desc_ua_site = get_meta_from_url(url_ua)
+                                site_cache[url] = (title_ru_site, desc_ru_site, title_ua_site, desc_ua_site)
+
+                            status_text.text("Проверка завершена!")
+
+                            results = []
+                            for index, row in df.iterrows():
+                                url = str(row['URL']).strip()
+                                title_ru_site, desc_ru_site, title_ua_site, desc_ua_site = site_cache.get(
+                                    url, ('[URL пустой/не проверен]', '', '[URL пустой/не проверен]', '')
+                                )
+                                row_result = {
+                                    'URL': url,
+                                    'Title RU (таблица)': row.get('Title RU', ''),
+                                    'Description RU (таблица)': row.get('Description RU', ''),
+                                    'Title UA (таблица)': row.get('Title UA', ''),
+                                    'Description UA (таблица)': row.get('Description UA', ''),
+                                    'Title RU (сайт)': title_ru_site,
+                                    'Description RU (сайт)': desc_ru_site,
+                                    'Title UA (сайт)': title_ua_site,
+                                    'Description UA (сайт)': desc_ua_site,
+                                }
+                                row_result['Title RU Совпадение (%)'] = get_similarity(clean_text(row.get('Title RU', '')), clean_text(title_ru_site))
+                                row_result['Description RU Совпадение (%)'] = get_similarity(clean_text(row.get('Description RU', '')), clean_text(desc_ru_site))
+                                row_result['Title UA Совпадение (%)'] = get_similarity(clean_text(row.get('Title UA', '')), clean_text(title_ua_site))
+                                row_result['Description UA Совпадение (%)'] = get_similarity(clean_text(row.get('Description UA', '')), clean_text(desc_ua_site))
+                                results.append(row_result)
+
+                            result_df = pd.DataFrame(results)
+                            st.session_state.meta2_result_df = result_df
+                            st.session_state.meta2_data_source = current_meta2_signature
+                        st.success("Файл загружен успешно. Проверка завершена!")
+
+                    if st.session_state.meta2_result_df is not None:
+                        if st.session_state.meta2_data_source == current_meta2_signature:
+                            # Скачивание без временных файлов на диске — Excel собирается в памяти.
+                            excel_buffer = io.BytesIO()
+                            st.session_state.meta2_result_df.to_excel(excel_buffer, index=False)
+                            st.download_button(
+                                "📥 Скачать результат",
+                                data=excel_buffer.getvalue(),
+                                file_name="seo_meta_check_result.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            )
+                        else:
+                            st.info("Загружен новый файл — нажмите «🚀 Начать проверку», чтобы обновить результаты.")
 
         with tabs2[1]:
             st.subheader("📋 Результаты проверки")
             result_df = st.session_state.get('meta2_result_df', None)
+            if (result_df is not None and st.session_state.get('meta2_data_source')
+                    != st.session_state.get('meta2_current_signature')):
+                st.warning("⚠️ Показаны результаты предыдущей проверки — файл изменился. "
+                           "Перейдите на вкладку «Загрузка» и нажмите «🚀 Начать проверку».")
             if result_df is not None:
                 min_similarity = st.slider("Минимальный процент совпадения", 0, 100, 50)
                 filtered_df = result_df.copy()
