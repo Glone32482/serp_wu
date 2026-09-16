@@ -659,10 +659,10 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
         expected_title_col = COL_TITLE_UA_EXCEL; expected_desc_col = COL_DESC_UA_EXCEL
         exact_phrases_col = COL_EXACT_PHRASES_UA_EXCEL; lsi_col = COL_LSI_UA_EXCEL
         if expected_title_col not in df_excel.columns and COL_TITLE_RU_EXCEL in df_excel.columns:
-            if debug_mode and 'debug_messages' in st.session_state: st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ (UA): Кол. Title '{COL_TITLE_UA_EXCEL}' нет, использую '{COL_TITLE_RU_EXCEL}'.")
+            st.info(f"ℹ️ Колонки '{COL_TITLE_UA_EXCEL}' нет — для UA использую '{COL_TITLE_RU_EXCEL}'.")
             expected_title_col = COL_TITLE_RU_EXCEL
         if expected_desc_col not in df_excel.columns and COL_DESC_RU_EXCEL in df_excel.columns:
-            if debug_mode and 'debug_messages' in st.session_state: st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ (UA): Кол. Desc '{COL_DESC_UA_EXCEL}' нет, использую '{COL_DESC_RU_EXCEL}'.")
+            st.info(f"ℹ️ Колонки '{COL_DESC_UA_EXCEL}' нет — для UA использую '{COL_DESC_RU_EXCEL}'.")
             expected_desc_col = COL_DESC_RU_EXCEL
     else:
         expected_title_col = COL_TITLE_RU_EXCEL; expected_desc_col = COL_DESC_RU_EXCEL
@@ -674,8 +674,7 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
         if exact_phrases_col not in df_excel.columns:
             bare_exact_phrases_col = 'Фразы в точном вхождении'
             if bare_exact_phrases_col in df_excel.columns:
-                if debug_mode and 'debug_messages' in st.session_state:
-                    st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ (RU): Кол. '{exact_phrases_col}' нет, использую '{bare_exact_phrases_col}'.")
+                st.info(f"ℹ️ Колонки '{COL_EXACT_PHRASES_RU_EXCEL}' нет — для RU использую '{bare_exact_phrases_col}'.")
                 exact_phrases_col = bare_exact_phrases_col
     required_cols_for_run = [COL_URL_RU_EXCEL, expected_title_col, expected_desc_col]
     missing_cols_in_df = [col for col in required_cols_for_run if col not in df_excel.columns]
@@ -687,8 +686,12 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
     with sub_tab_meta:
         tab1_errors_summary = {'load_error': 0, 'title_mismatch': 0, 'desc_mismatch': 0}
         tab1_processed_rows_data, urls_with_meta_issues_list_tab1 = [], []
+        skipped_empty_url_count_meta = 0
         for index, row_from_df in df_excel.iterrows():
-            base_url_from_row = str(row_from_df[COL_URL_RU_EXCEL])
+            base_url_from_row = str(row_from_df[COL_URL_RU_EXCEL]).strip()
+            if not base_url_from_row or base_url_from_row.lower() in ('nan', 'none'):
+                skipped_empty_url_count_meta += 1
+                continue
             page_lang_specific_data = all_site_data.get(base_url_from_row, {}).get(lang_to_check, {})
             item_details = {'url': base_url_from_row, 'final_url': page_lang_specific_data.get('final_url_fetched', base_url_from_row), 'has_issue': False, 'issue_details': []}
             if page_lang_specific_data.get('error'):
@@ -723,7 +726,8 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                 if not desc_match: tab1_errors_summary['desc_mismatch'] += 1; item_details['has_issue'] = True; item_details['issue_details'].append(f'Desc совпадает на {desc_similarity}%')
             if item_details['has_issue']: urls_with_meta_issues_list_tab1.append(item_details['final_url'])
             tab1_processed_rows_data.append(item_details)
-        st.info(f"Ошибок загрузки: {tab1_errors_summary['load_error']} | Несовп. Title: {tab1_errors_summary['title_mismatch']} | Несовп. Desc: {tab1_errors_summary['desc_mismatch']}")
+        skipped_note = f" | Пропущено строк с пустым URL: {skipped_empty_url_count_meta}" if skipped_empty_url_count_meta else ""
+        st.info(f"Ошибок загрузки: {tab1_errors_summary['load_error']} | Несовп. Title: {tab1_errors_summary['title_mismatch']} | Несовп. Desc: {tab1_errors_summary['desc_mismatch']}{skipped_note}")
 
         # --- Скачать отчёт по Title/Description (тот же формат, что во вкладке Tittle_Description+) ---
         meta_report_rows = []
@@ -754,6 +758,15 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
             key=f"dl_meta_report_{lang_to_check}"
         )
 
+        # Сводная таблица для быстрого просмотра — вместо того, чтобы разворачивать
+        # каждый URL по отдельности, чтобы просто увидеть, где несовпадение.
+        if not meta_report_df.empty:
+            with st.expander("📊 Сводная таблица по всем URL", expanded=False):
+                st.dataframe(
+                    meta_report_df[["URL", "Title совпадает", "Title схожесть (%)", "Description совпадает", "Description схожесть (%)"]],
+                    hide_index=True, use_container_width=True, height=400
+                )
+
         show_only_meta_errors_cb = st.checkbox("Показать только URL с ошибками", value=True, key=f"show_err_meta_{lang_to_check}")
         for item_m in tab1_processed_rows_data:
             if show_only_meta_errors_cb and not item_m['has_issue']: continue
@@ -773,11 +786,19 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
         stat_text_phrases = st.empty()
         exact_col_exists = exact_phrases_col in df_excel.columns
         lsi_col_exists = lsi_col in df_excel.columns
-        if not exact_col_exists and debug_mode and 'debug_messages' in st.session_state: st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ ({lang_to_check.upper()}): Кол. точных фраз '{exact_phrases_col}' не найдена.")
-        if not lsi_col_exists and debug_mode and 'debug_messages' in st.session_state: st.session_state.debug_messages.append(f"ПРЕДУПРЕЖДЕНИЕ ({lang_to_check.upper()}): Кол. LSI '{lsi_col}' не найдена.")
+        if not exact_col_exists or not lsi_col_exists:
+            missing_bits = []
+            if not exact_col_exists: missing_bits.append(f"точных фраз ('{exact_phrases_col}')")
+            if not lsi_col_exists: missing_bits.append(f"LSI ('{lsi_col}')")
+            st.warning(f"⚠️ Колонка {' и '.join(missing_bits)} не найдена в файле для {lang_to_check.upper()} — "
+                       f"эти фразы проверяться не будут (это не ошибка, если их и не было в задаче).")
         phrase_results_list = []
+        skipped_empty_url_count = 0
         for idx, df_row in df_excel.iterrows():
-            base_url_from_row = str(df_row[COL_URL_RU_EXCEL])
+            base_url_from_row = str(df_row[COL_URL_RU_EXCEL]).strip()
+            if not base_url_from_row or base_url_from_row.lower() in ('nan', 'none'):
+                skipped_empty_url_count += 1
+                continue
             stat_text_phrases.info(f"Анализ фраз для URL {idx + 1}/{len(df_excel)}: {base_url_from_row}")
             prog_bar_phrases.progress((idx + 1) / len(df_excel))
             lang_data = all_site_data.get(base_url_from_row, {}).get(lang_to_check, {})
@@ -833,7 +854,11 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                                         "Фраза": st.column_config.TextColumn("Фраза", width="large")})
             csv_dl = filtered_df.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(f"📥 Скачать результаты ({lang_to_check.upper()})", csv_dl, f'filtered_phrases_{lang_to_check}.csv', 'text/csv', key=f"dl_phr_t2_btn_{lang_to_check}")
-        else: st.warning(f"Нет данных по фразам для отображения.")
+        elif skipped_empty_url_count == len(df_excel):
+            st.warning("⚠️ Во всех строках файла пустой URL — проверять нечего.")
+        else:
+            st.warning("⚠️ Нет данных по фразам для отображения. Обычно это значит, что в файле нет колонок "
+                       "с точными/LSI-фразами (см. предупреждение выше) или они пустые для всех строк.")
 
 # --- КОНСТАНТЫ ДЛЯ ПРОВЕРКИ ИЗОБРАЖЕНИЙ АПТЕК ---
 ID_COLUMN_NAME_EXCEL = "id"
@@ -1831,6 +1856,12 @@ def main():
 
         uploaded_file = st.file_uploader("📤 Загрузите Excel файл с данными", type=["xlsx"])
         if 'processed_data' not in st.session_state: st.session_state.processed_data = None
+        if 'processed_data_source' not in st.session_state: st.session_state.processed_data_source = None
+        # Сигнатура файла (имя+размер) — чтобы отличить "результаты для ЭТОГО файла"
+        # от результатов прошлого запуска. Раньше при смене файла без повторного
+        # нажатия кнопки старые результаты всё равно показывались, но против
+        # новой таблицы — выглядело как баг, а не как подсказка "нажмите кнопку".
+        current_file_signature = (uploaded_file.name, uploaded_file.size) if uploaded_file else None
 
         if uploaded_file and st.button("🚀 Начать проверку всех URL из файла", key="start_full_processing_btn"):
             st.session_state.debug_messages = []
@@ -1860,6 +1891,7 @@ def main():
                 load_progress_text_ui.info(st.session_state.global_progress_text)
 
                 st.session_state.processed_data = load_all_pages_data_for_both_langs(df_excel, debug_mode)
+                st.session_state.processed_data_source = current_file_signature
 
                 load_progress_text_ui.success(st.session_state.get('global_progress_text', "Загрузка данных завершена!"))
                 load_progress_bar_ui.progress(st.session_state.get('global_progress_value', 1.0))
@@ -1884,7 +1916,9 @@ def main():
                     print(f"Критическая ошибка (debug_mode не был определен или False в момент исключения): {e}")
                     traceback.print_exc()
 
-        if uploaded_file and st.session_state.get('processed_data') is not None:
+        if uploaded_file and st.session_state.get('processed_data') is not None and st.session_state.get('processed_data_source') != current_file_signature:
+            st.info("ℹ️ Загружен другой файл (или он изменился) — нажмите «🚀 Начать проверку всех URL из файла» выше, чтобы обработать именно его. Показывать результаты прошлого файла для нового не будем, чтобы не путать.")
+        elif uploaded_file and st.session_state.get('processed_data') is not None:
             df_for_tabs_display = None
             try:
                 if 'df_excel' in locals() and df_excel is not None:
