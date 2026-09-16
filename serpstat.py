@@ -715,6 +715,36 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
             if item_details['has_issue']: urls_with_meta_issues_list_tab1.append(item_details['final_url'])
             tab1_processed_rows_data.append(item_details)
         st.info(f"Ошибок загрузки: {tab1_errors_summary['load_error']} | Несовп. Title: {tab1_errors_summary['title_mismatch']} | Несовп. Desc: {tab1_errors_summary['desc_mismatch']}")
+
+        # --- Скачать отчёт по Title/Description (тот же формат, что во вкладке Tittle_Description+) ---
+        meta_report_rows = []
+        for item_r in tab1_processed_rows_data:
+            is_load_error = any("Ошибка загрузки" in d for d in item_r.get('issue_details', []))
+            meta_report_rows.append({
+                "URL": item_r.get('url', ''),
+                "Финальный URL": item_r.get('final_url', ''),
+                "Ошибка загрузки": "; ".join(item_r['issue_details']) if is_load_error else "",
+                f"Title ({expected_title_col})": item_r.get('expected_title', ''),
+                "Title на сайте": item_r.get('site_title', ''),
+                "Title совпадает": '' if is_load_error else ("Да" if item_r.get('title_match') else "Нет"),
+                "Title схожесть (%)": '' if is_load_error else item_r.get('title_similarity', ''),
+                f"Description ({expected_desc_col})": item_r.get('expected_desc', ''),
+                "Description на сайте": item_r.get('site_desc', ''),
+                "Description совпадает": '' if is_load_error else ("Да" if item_r.get('desc_match') else "Нет"),
+                "Description схожесть (%)": '' if is_load_error else item_r.get('desc_similarity', ''),
+            })
+        meta_report_df = pd.DataFrame(meta_report_rows)
+        meta_report_buffer = BytesIO()
+        with pd.ExcelWriter(meta_report_buffer, engine='xlsxwriter') as meta_report_writer:
+            meta_report_df.to_excel(meta_report_writer, index=False, sheet_name=f'Title_Description_{lang_to_check.upper()}'[:31])
+        st.download_button(
+            f"📥 Скачать отчёт Title/Description ({lang_to_check.upper()})",
+            data=meta_report_buffer.getvalue(),
+            file_name=f"seo_meta_checker_title_description_{lang_to_check}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_meta_report_{lang_to_check}"
+        )
+
         show_only_meta_errors_cb = st.checkbox("Показать только URL с ошибками", value=True, key=f"show_err_meta_{lang_to_check}")
         for item_m in tab1_processed_rows_data:
             if show_only_meta_errors_cb and not item_m['has_issue']: continue
