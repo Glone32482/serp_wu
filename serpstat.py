@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import io
 import re
+import json
 from collections import Counter
 import pymorphy3
 import base64
@@ -82,6 +83,25 @@ DEFAULT_STEM_FUZZY_RATIO_THRESHOLD = 90
 # никогда не совпадут побайтово с реальным текстом на сайте, поэтому вместо
 # точного равенства строк считаем процент схожести после очистки от шаблонов.
 META_MATCH_THRESHOLD = 80
+
+# --- КОНСТАНТЫ ДЛЯ ВКЛАДКИ "Диф каталога между снапшотами" ---
+# Названия колонок файла-снапшота, который эта вкладка сама генерирует и который
+# нужно скачать и загрузить обратно при следующем прогоне (см. пояснение внутри вкладки
+# про то, почему это не хранится автоматически между запусками).
+CATALOG_DIFF_COL_URL = 'URL'
+CATALOG_DIFF_COL_NAME = 'Название (сайт)'
+CATALOG_DIFF_COL_TITLE = 'Title'
+CATALOG_DIFF_COL_DESC = 'Description'
+CATALOG_DIFF_COL_PRICE_MIN = 'Цена мин'
+CATALOG_DIFF_COL_PRICE_MAX = 'Цена макс'
+CATALOG_DIFF_COL_AVAILABILITY = 'Наличие'
+CATALOG_DIFF_COL_ERROR = 'Ошибка загрузки'
+CATALOG_DIFF_COL_SNAPSHOT_DATE = 'Дата снапшота'
+CATALOG_DIFF_SNAPSHOT_COLUMNS = [
+    CATALOG_DIFF_COL_URL, CATALOG_DIFF_COL_NAME, CATALOG_DIFF_COL_TITLE, CATALOG_DIFF_COL_DESC,
+    CATALOG_DIFF_COL_PRICE_MIN, CATALOG_DIFF_COL_PRICE_MAX, CATALOG_DIFF_COL_AVAILABILITY,
+    CATALOG_DIFF_COL_ERROR, CATALOG_DIFF_COL_SNAPSHOT_DATE,
+]
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -1098,6 +1118,389 @@ async def run_all_checks_async(
         })
     return final_aggregated_results
 
+# ========== ВКЛАДКА: Диф каталога между снапшотами ==========
+def _normalize_availability(raw_value: str) -> str:
+    """Приводит разные варианты значения "наличие" к одному читаемому виду:
+    Schema.org отдаёт полный URL типа 'http://schema.org/InStock', встроенный
+    JS-стейт страницы — короткие 'yes'/'no'. Берём последний сегмент пути и матчим
+    по словарю, а неизвестное значение показываем как есть, а не прячем."""
+    if not raw_value:
+        return ''
+    raw = str(raw_value).strip()
+    key = raw.rsplit('/', 1)[-1].strip().lower()
+    mapping = {
+        'instock': 'В наличии', 'limitedavailability': 'Ограниченно в наличии',
+        'outofstock': 'Нет в наличии', 'soldout': 'Нет в наличии',
+        'discontinued': 'Товар снят с продажи', 'preorder': 'Предзаказ',
+        'yes': 'В наличии', 'no': 'Нет в наличии', '1': 'В наличии', '0': 'Нет в наличии',
+    }
+    return mapping.get(key, raw)
+
+def _extract_price_availability_from_html(html_content: str) -> Dict[str, str]:
+    """Достаёт название товара, цену (мин/макс) и наличие со страницы товара apteka911.
+    Источники по приоритету (от самого надёжного к самому хрупкому — по образцу
+    реальной страницы товара, которую нам присылали для разбора):
+      1) Schema.org JSON-LD (<script type="application/ld+json"> с "@type":"Product") —
+         offers.lowPrice/offers.highPrice/offers.price и offers.availability. Это
+         структурированные данные, которые сайт отдаёт специально для парсеров/поисковиков,
+         и они меньше всего зависят от того, как выглядит вёрстка страницы.
+      2) Встроенный JS-стейт страницы (Vue): productPrice/productPriceMin/
+         productPriceMax/productAvail.
+      3) Видимый HTML-блок цены (class="price-new"/"card-price") — самый хрупкий
+         запасной вариант, на случай если первые два источника пропали."""
+    result = {'name': '', 'price_min': '', 'price_max': '', 'availability': ''}
+
+    # 1) Schema.org JSON-LD
+    for match in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                              html_content, re.DOTALL | re.IGNORECASE):
+        raw_json = match.group(1).strip()
+        if not raw_json:
+            continue
+        try:
+            data = json.loads(raw_json)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        expanded = []
+        for item in candidates:
+            if isinstance(item, dict) and isinstance(item.get('@graph'), list):
+                expanded.extend(item['@graph'])
+            else:
+                expanded.append(item)
+        for item in expanded:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get('@type', '')
+            is_product = ('Product' in item_type) if isinstance(item_type, list) else (item_type == 'Product')
+            if not is_product:
+                continue
+            if item.get('name'):
+                result['name'] = str(item['name']).strip()
+            offers = item.get('offers')
+            offers_list = offers if isinstance(offers, list) else ([offers] if isinstance(offers, dict) else [])
+            for offer in offers_list:
+                if not isinstance(offer, dict):
+                    continue
+                low = offer.get('lowPrice') or offer.get('price')
+                high = offer.get('highPrice') or offer.get('price')
+                if low and not result['price_min']:
+                    result['price_min'] = str(low).strip()
+                if high and not result['price_max']:
+                    result['price_max'] = str(high).strip()
+                if offer.get('availability') and not result['availability']:
+                    result['availability'] = _normalize_availability(offer['availability'])
+            if result['price_min'] or result['availability']:
+                return result
+
+    # 2) Встроенный JS-стейт (Vue) страницы товара
+    if not result['price_min']:
+        m = re.search(r'"productPriceMin"\s*:\s*"?([\d.,]+)"?', html_content)
+        if m: result['price_min'] = m.group(1).replace(',', '.')
+    if not result['price_max']:
+        m = re.search(r'"productPriceMax"\s*:\s*"?([\d.,]+)"?', html_content)
+        if m: result['price_max'] = m.group(1).replace(',', '.')
+    if not result['price_min']:
+        m = re.search(r'"productPrice"\s*:\s*"?([\d.,]+)"?', html_content)
+        if m: result['price_min'] = result['price_max'] = m.group(1).replace(',', '.')
+    if not result['availability']:
+        m = re.search(r'"productAvail"\s*:\s*"?(\w+)"?', html_content)
+        if m: result['availability'] = _normalize_availability(m.group(1))
+
+    # 3) Видимый HTML-блок цены — самый хрупкий запасной вариант
+    if not result['price_min']:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        price_tag = soup.find(class_='price-new') or soup.find(class_='card-price')
+        if price_tag:
+            price_text = price_tag.get_text(' ', strip=True).replace(' ', '')
+            m = re.search(r'([\d]+[.,]?[\d]*)', price_text)
+            if m:
+                result['price_min'] = result['price_max'] = m.group(1).replace(',', '.')
+
+    return result
+
+async def _fetch_catalog_snapshot_row_async(http_session: "aiohttp.ClientSession", semaphore: asyncio.Semaphore,
+                                             url: str, max_retries: int = 2) -> Dict[str, str]:
+    """Тянет одну страницу товара и собирает по ней строку снапшота: Title/Description
+    (через общий _extract_page_content(), как в SEO Meta Checker) плюс название/цену/
+    наличие (через _extract_price_availability_from_html()). Ретраи с нарастающей
+    задержкой — та же логика, что уже используется в _fetch_page_data_async()."""
+    async with semaphore:
+        headers = {
+            'User-Agent': DEFAULT_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'ru-RU,ru;q=1.0,uk;q=0.8,en-US;q=0.6,en;q=0.4',
+        }
+        row = {
+            CATALOG_DIFF_COL_URL: url, CATALOG_DIFF_COL_NAME: '', CATALOG_DIFF_COL_TITLE: '',
+            CATALOG_DIFF_COL_DESC: '', CATALOG_DIFF_COL_PRICE_MIN: '', CATALOG_DIFF_COL_PRICE_MAX: '',
+            CATALOG_DIFF_COL_AVAILABILITY: '', CATALOG_DIFF_COL_ERROR: '',
+            CATALOG_DIFF_COL_SNAPSHOT_DATE: pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+        }
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with http_session.get(url, headers=headers, cookies={'language': 'ru', 'lang': 'ru'},
+                                             timeout=aiohttp.ClientTimeout(total=20), ssl=False,
+                                             allow_redirects=True) as response:
+                    response.raise_for_status()
+                    final_url = str(response.url)
+                    raw_bytes = await response.read()
+                    html_content = raw_bytes.decode('utf-8', errors='ignore')
+                page_content = _extract_page_content(html_content, final_url)
+                price_info = _extract_price_availability_from_html(html_content)
+                row[CATALOG_DIFF_COL_TITLE] = page_content.get('title', '')
+                row[CATALOG_DIFF_COL_DESC] = page_content.get('description', '')
+                row[CATALOG_DIFF_COL_NAME] = price_info.get('name', '')
+                row[CATALOG_DIFF_COL_PRICE_MIN] = price_info.get('price_min', '')
+                row[CATALOG_DIFF_COL_PRICE_MAX] = price_info.get('price_max', '')
+                row[CATALOG_DIFF_COL_AVAILABILITY] = price_info.get('availability', '')
+                return row
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        row[CATALOG_DIFF_COL_ERROR] = f"Ошибка запроса: {last_error}"
+        return row
+
+async def _build_catalog_snapshot_async(urls: List[str], max_concurrent: int,
+                                         progress_bar_ui=None, status_text_ui=None) -> List[Dict[str, str]]:
+    semaphore = asyncio.Semaphore(max_concurrent)
+    connector = aiohttp.TCPConnector(ssl=False, limit=max_concurrent)
+    rows = []
+    async with aiohttp.ClientSession(connector=connector) as http_session:
+        tasks = [_fetch_catalog_snapshot_row_async(http_session, semaphore, u) for u in urls]
+        total = len(tasks)
+        completed = 0
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            rows.append(res)
+            completed += 1
+            if progress_bar_ui: progress_bar_ui.progress(completed / total)
+            if status_text_ui: status_text_ui.text(f"Обработка: {completed}/{total} ({res[CATALOG_DIFF_COL_URL]})")
+    url_order = {u: i for i, u in enumerate(urls)}
+    rows.sort(key=lambda r: url_order.get(r[CATALOG_DIFF_COL_URL], 0))
+    return rows
+
+def _dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        worksheet = writer.sheets[sheet_name]
+        for idx, col in enumerate(df.columns):
+            series = df[col]
+            max_len = max((series.astype(str).map(len).max() if len(series) else 0), len(str(col))) + 2
+            worksheet.set_column(idx, idx, min(max_len, 60))
+    return output.getvalue()
+
+def _values_differ(old_val: str, new_val: str) -> bool:
+    """Сравнивает старое/новое значение поля снапшота. Для цены/чисел пробуем
+    сравнить как float, чтобы '14.50' и '14.5' не считались изменением из-за
+    разного форматирования — важно только реальное изменение значения."""
+    old_str, new_str = str(old_val or '').strip(), str(new_val or '').strip()
+    if old_str == new_str:
+        return False
+    try:
+        return float(old_str.replace(',', '.')) != float(new_str.replace(',', '.'))
+    except (ValueError, TypeError):
+        return old_str != new_str
+
+def _diff_catalog_snapshots(previous_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    """Расширенное сравнение двух снапшотов каталога: не только "URL пропал/появился",
+    а по каждому общему URL — что именно изменилось (Title, Description, цена мин/макс,
+    наличие, название). Именно такой вариант ("расширенный") и был выбран для этой вкладки."""
+    prev_by_url = {str(r[CATALOG_DIFF_COL_URL]).strip(): r for r in previous_df.to_dict('records')}
+    curr_by_url = {str(r[CATALOG_DIFF_COL_URL]).strip(): r for r in current_df.to_dict('records')}
+    all_urls = list(dict.fromkeys(list(prev_by_url.keys()) + list(curr_by_url.keys())))
+
+    compare_fields = [
+        (CATALOG_DIFF_COL_NAME, 'Название'),
+        (CATALOG_DIFF_COL_TITLE, 'Title'),
+        (CATALOG_DIFF_COL_DESC, 'Description'),
+        (CATALOG_DIFF_COL_PRICE_MIN, 'Цена мин'),
+        (CATALOG_DIFF_COL_PRICE_MAX, 'Цена макс'),
+        (CATALOG_DIFF_COL_AVAILABILITY, 'Наличие'),
+    ]
+    result_rows = []
+    for url in all_urls:
+        prev_row, curr_row = prev_by_url.get(url), curr_by_url.get(url)
+        out = {'URL': url}
+        if prev_row is not None and curr_row is None:
+            out['Статус'] = '❌ Товар пропал из текущего списка'
+            out['Что изменилось'] = ''
+            for col, label in compare_fields:
+                out[f'{label} (было)'] = prev_row.get(col, '')
+                out[f'{label} (сейчас)'] = ''
+        elif prev_row is None and curr_row is not None:
+            out['Статус'] = '🆕 Новый товар'
+            out['Что изменилось'] = ''
+            for col, label in compare_fields:
+                out[f'{label} (было)'] = ''
+                out[f'{label} (сейчас)'] = curr_row.get(col, '')
+        else:
+            changed_labels = []
+            for col, label in compare_fields:
+                old_val, new_val = prev_row.get(col, ''), curr_row.get(col, '')
+                out[f'{label} (было)'] = old_val
+                out[f'{label} (сейчас)'] = new_val
+                if _values_differ(old_val, new_val):
+                    changed_labels.append(label)
+            curr_error = str(curr_row.get(CATALOG_DIFF_COL_ERROR, '') or '').strip()
+            if curr_error:
+                out['Статус'] = '⚠️ Не удалось обработать сейчас'
+                out['Что изменилось'] = curr_error
+            elif changed_labels:
+                out['Статус'] = '✏️ Есть изменения'
+                out['Что изменилось'] = ', '.join(changed_labels)
+            else:
+                out['Статус'] = '✅ Без изменений'
+                out['Что изменилось'] = ''
+        result_rows.append(out)
+
+    diff_df = pd.DataFrame(result_rows)
+    status_order = {'⚠️ Не удалось обработать сейчас': 0, '❌ Товар пропал из текущего списка': 1,
+                     '🆕 Новый товар': 2, '✏️ Есть изменения': 3, '✅ Без изменений': 4}
+    diff_df['_order'] = diff_df['Статус'].map(status_order).fillna(9)
+    diff_df = diff_df.sort_values('_order').drop(columns=['_order']).reset_index(drop=True)
+    return diff_df
+
+def catalog_diff_snapshot_tab():
+    st.title("📦 Диф каталога между снапшотами")
+    show_tab_help(
+        "берёт список URL товаров, прямо сейчас обходит каждую страницу и снимает "
+        "«снапшот» (название, Title, Description, цена, наличие), а затем сравнивает его "
+        "с предыдущим снапшотом — файлом, который эта же вкладка выгрузила в прошлый раз. "
+        "Показывает, что реально изменилось: новые/пропавшие товары, смена цены или наличия, "
+        "правки Title/Description.",
+        columns=f"`{CATALOG_DIFF_COL_URL}` — один столбец со ссылками на товары. Остальные колонки не используются."
+    )
+    st.markdown(
+        "**Как это работает:**\n"
+        "1. Загружаете Excel со списком URL текущего каталога (или его части).\n"
+        "2. Нажимаете «Обработать» — вкладка обойдёт все ссылки и соберёт текущие данные.\n"
+        "3. Скачиваете получившийся снапшот — он и есть ваша «память» для следующего раза.\n"
+        "4. В следующий раз, когда снова придёте на эту вкладку — загружаете тот же файл со "
+        "списком URL и **этот скачанный снапшот** во второй загрузчик, жмёте «Сравнить» — "
+        "увидите таблицу изменений.\n\n"
+        "⚠️ Инструмент работает в облаке (Streamlit Cloud), поэтому сам между запусками "
+        "ничего не запоминает — прошлый снапшот нужно каждый раз скачивать и загружать "
+        "обратно при следующем сравнении."
+    )
+    st.markdown("---")
+    st.subheader("1. Текущий список URL")
+    uploaded_urls_file = st.file_uploader(
+        f"Excel со столбцом '{CATALOG_DIFF_COL_URL}' (список товаров, которые нужно проверить).",
+        type=["xlsx", "xls"], key="catalog_diff_urls_uploader"
+    )
+    if not uploaded_urls_file:
+        return
+    try:
+        urls_df = pd.read_excel(uploaded_urls_file)
+    except Exception as e:
+        st.error(f"Не удалось прочитать файл: {e}")
+        return
+    if CATALOG_DIFF_COL_URL not in urls_df.columns:
+        st.error(f"В файле нет обязательного столбца '{CATALOG_DIFF_COL_URL}'.")
+        return
+    st.success(f"Файл '{uploaded_urls_file.name}' загружен. Строк: {len(urls_df)}")
+    st.dataframe(urls_df.head())
+
+    current_file_signature = (uploaded_urls_file.name, uploaded_urls_file.size)
+    if st.session_state.get('catalog_diff_snapshot_source') is not None and \
+       st.session_state.get('catalog_diff_snapshot_source') != current_file_signature:
+        st.info("ℹ️ Загружен другой файл (или он изменился) — нажмите «Обработать» ниже, "
+                "чтобы снять снапшот именно для него.")
+
+    max_concurrent = st.slider("Количество параллельных запросов:", 1, 30, 10, key="catalog_diff_concurrency")
+
+    if st.button("🚀 Обработать (снять текущий снапшот)", key="catalog_diff_process_button"):
+        urls_list = [str(u).strip() for u in urls_df[CATALOG_DIFF_COL_URL].tolist()
+                     if str(u).strip() and str(u).strip().lower() not in ('nan', 'none')]
+        urls_list = list(dict.fromkeys(urls_list))
+        if not urls_list:
+            st.warning("В файле не найдено валидных URL.")
+        else:
+            progress_bar_ui = st.progress(0.0)
+            status_text_ui = st.empty()
+            try:
+                current_snapshot_rows = asyncio.run(
+                    _build_catalog_snapshot_async(urls_list, max_concurrent, progress_bar_ui, status_text_ui)
+                )
+                st.session_state['catalog_diff_current_snapshot'] = current_snapshot_rows
+                st.session_state['catalog_diff_snapshot_source'] = current_file_signature
+                st.session_state.pop('catalog_diff_result', None)
+                status_text_ui.success(f"Снапшот собран: {len(current_snapshot_rows)} URL.")
+            except Exception as e:
+                st.error(f"Ошибка при обходе ссылок: {e}")
+                st.exception(e)
+
+    if not st.session_state.get('catalog_diff_current_snapshot') or \
+       st.session_state.get('catalog_diff_snapshot_source') != current_file_signature:
+        return
+
+    current_df = pd.DataFrame(st.session_state['catalog_diff_current_snapshot'], columns=CATALOG_DIFF_SNAPSHOT_COLUMNS)
+    st.markdown("---")
+    st.subheader("2. Текущий снапшот")
+    n_errors = int((current_df[CATALOG_DIFF_COL_ERROR].astype(str).str.strip() != '').sum())
+    st.caption(f"Собрано строк: {len(current_df)}. Ошибок загрузки: {n_errors}.")
+    st.dataframe(current_df.head())
+    current_excel_bytes = _dataframe_to_excel_bytes(current_df, sheet_name="Снапшот")
+    st.download_button(
+        "📥 Скачать текущий снапшот (сохраните для сравнения в следующий раз)",
+        data=current_excel_bytes,
+        file_name=f"catalog_snapshot_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="catalog_diff_download_current_snapshot"
+    )
+
+    st.markdown("---")
+    st.subheader("3. Сравнение с прошлым снапшотом")
+    previous_snapshot_file = st.file_uploader(
+        "Загрузите файл прошлого снапшота (тот, что скачали на этой вкладке в предыдущий раз). "
+        "Если сравниваете впервые — пропустите этот шаг: просто сохраните текущий снапшот выше на будущее.",
+        type=["xlsx", "xls"], key="catalog_diff_previous_uploader"
+    )
+    if not previous_snapshot_file:
+        st.info("Прошлый снапшот не загружен — сравнение пока недоступно, доступны только текущие данные выше.")
+        return
+    try:
+        previous_df = pd.read_excel(previous_snapshot_file)
+    except Exception as e:
+        st.error(f"Не удалось прочитать файл прошлого снапшота: {e}")
+        return
+    required_cols = {CATALOG_DIFF_COL_URL, CATALOG_DIFF_COL_TITLE, CATALOG_DIFF_COL_DESC,
+                      CATALOG_DIFF_COL_PRICE_MIN, CATALOG_DIFF_COL_PRICE_MAX, CATALOG_DIFF_COL_AVAILABILITY}
+    if not required_cols.issubset(previous_df.columns):
+        st.error("Файл прошлого снапшота должен быть тем же файлом, который скачала эта вкладка "
+                  f"(нужны столбцы: {', '.join(sorted(required_cols))}).")
+        return
+
+    if st.button("🔍 Сравнить", key="catalog_diff_compare_button"):
+        st.session_state['catalog_diff_result'] = _diff_catalog_snapshots(previous_df, current_df)
+
+    if st.session_state.get('catalog_diff_result') is None:
+        return
+    diff_df = st.session_state['catalog_diff_result']
+    st.markdown("---")
+    st.subheader("📊 Результат сравнения")
+    if 'Статус' in diff_df.columns:
+        unique_statuses = sorted(diff_df['Статус'].dropna().unique().tolist())
+        selected_statuses = st.multiselect("Фильтр по статусу:", options=unique_statuses,
+                                            default=unique_statuses, key="catalog_diff_status_filter")
+        diff_df_filtered = diff_df[diff_df['Статус'].isin(selected_statuses)]
+    else:
+        diff_df_filtered = diff_df
+    st.caption(f"Показано {len(diff_df_filtered)} из {len(diff_df)} записей.")
+    table_height = min(600, 35 * (len(diff_df_filtered) + 1) + 3)
+    st.dataframe(diff_df_filtered, height=table_height, use_container_width=True)
+    diff_excel_bytes = _dataframe_to_excel_bytes(diff_df_filtered, sheet_name="Diff")
+    st.download_button(
+        "📥 Скачать отчёт по изменениям",
+        data=diff_excel_bytes,
+        file_name=f"catalog_diff_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="catalog_diff_download_diff"
+    )
+
 def pharmacy_image_url_checker_tab():
     st.title("⚕️ Проверка доступности изображений аптек (JPEG и PNG)")
     show_tab_help(
@@ -1236,6 +1639,7 @@ def main():
             "🔍 SEO Meta Checker",
             "🧪 Tittle_Description +",
             "🖼️ Проверка URL изображений аптек",
+            "📦 Диф каталога между снапшотами",
             "🤖 GPT-ассистент",
             "📖 Инструкция"
         ],
@@ -1467,6 +1871,19 @@ def main():
         - Для каждого ID по шаблонам строится URL изображения и проверяется, что он действительно отдаёт картинку (проверяются оба варианта расширения — .jpeg и .png).
         - Запросы идут параллельно (количество настраивается слайдером).
         - Результаты можно отфильтровать по статусу (например, показать только "Не найдено") и скачать полный отчёт в Excel.
+
+        ---
+        ### 📦 Диф каталога между снапшотами
+        **Сравнивает текущий каталог с предыдущим снапшотом: что изменилось.**
+        - Загружаете Excel со столбцом **URL** — список товаров для проверки.
+        - Нажимаете «Обработать» — вкладка прямо сейчас обходит каждую страницу и собирает
+          название, Title, Description, цену (мин/макс) и наличие.
+        - Скачиваете получившийся снапшот — это и есть "память" между запусками (инструмент
+          работает в облаке и сам между сессиями ничего не хранит).
+        - В следующий раз загружаете актуальный список URL и **этот же скачанный файл** как
+          "прошлый снапшот", жмёте «Сравнить» — увидите таблицу: новые товары, пропавшие,
+          и по каждому оставшемуся — изменились ли Title/Description/цена/наличие/название.
+        - Результат можно отфильтровать по статусу и скачать отдельным отчётом.
 
         ---
         ### 🤖 GPT-ассистент
@@ -2137,6 +2554,9 @@ def main():
 
     if tab == "🖼️ Проверка URL изображений аптек":
         pharmacy_image_url_checker_tab()
+
+    if tab == "📦 Диф каталога между снапшотами":
+        catalog_diff_snapshot_tab()
 
 if __name__ == "__main__":
     main()
