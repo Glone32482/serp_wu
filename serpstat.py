@@ -2676,7 +2676,7 @@ def main():
                 st.markdown("---")
                 st.markdown("### 🌐 Переключатель версии сайта")
                 st.info("👇 Результаты разделены на две вкладки — кликните, чтобы посмотреть нужную версию:")
-                main_ru_tab, main_ua_tab = st.tabs(["🇷🇺 Русская Версия (RU)", "🇺🇦 Украинская Версия (UA)"])
+                main_ru_tab, main_ua_tab = st.tabs(["💩 Русская Версия (RU)", "🇺🇦 Украинская Версия (UA)"])
                 with main_ru_tab:
                     run_checks_for_language('ru', df_for_tabs_display, st.session_state.processed_data, debug_mode)
                 with main_ua_tab:
