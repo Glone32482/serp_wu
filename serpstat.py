@@ -223,7 +223,10 @@ def clean_text(text: Optional[Any]) -> str:
     text = re.sub(r'%drug%', '', text)
     text = re.sub(r'(цена от|ціна від)\s*[^|\n\r\-,]+', '', text)
     text = re.sub(r'(мис|міс)\s*аптека\s*9-1-1', '', text)
-    text = re.sub(r'[\-\|:,⭐⏩⚡🔹📦→®]', '', text)
+    # "?" и "!" добавлены отдельно от остальных — на сайте вопросительные заголовки
+    # вида "Аугментин 1000: как принимать?" не должны считаться несовпадением
+    # только из-за знака препинания, которого нет в таблице.
+    text = re.sub(r'[\-\|:,?!⭐⏩⚡🔹📦→®]', '', text)
     text = re.sub(r'грн|uah', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -260,7 +263,10 @@ def text_matches_template(expected: str, actual: str) -> bool:
     "Дексаметазон - цена от 32.50 грн, ...") оказывались чуть ниже порога
     и ошибочно помечались как несовпадающие.
     Если плейсхолдеров нет — используется прежняя логика (очистка + % схожести),
-    так как для обычного текста именно небольшие отличия важно ловить."""
+    так как для обычного текста именно небольшие отличия важно ловить.
+    Дополнительно: если после очистки набор слов в обеих строках совпадает
+    один в один (с учётом повторов), но слова стоят в другом порядке — это
+    тоже считается совпадением, а не ошибкой (перестановка слов — не опечатка)."""
     expected_s = (expected or "").strip()
     actual_s = (actual or "").strip()
     if not expected_s:
@@ -270,7 +276,12 @@ def text_matches_template(expected: str, actual: str) -> bool:
             return bool(_template_regex_from(expected_s).match(actual_s))
         except re.error:
             pass
-    return get_similarity(clean_text(expected_s), clean_text(actual_s)) >= META_MATCH_THRESHOLD
+    expected_clean = clean_text(expected_s)
+    actual_clean = clean_text(actual_s)
+    if get_similarity(expected_clean, actual_clean) >= META_MATCH_THRESHOLD:
+        return True
+    expected_words = expected_clean.split()
+    return bool(expected_words) and Counter(expected_words) == Counter(actual_clean.split())
 
 def normalize_for_search(text: Optional[Any]) -> str:
     """Улучшенная нормализация текста для поиска"""
@@ -356,9 +367,45 @@ def get_stem_for_word(word: str) -> Optional[str]:
     if not RUSSIAN_STEMMER or not word or not word.strip(): return None
     return RUSSIAN_STEMMER.stemWord(word.lower().strip())
 
+def _word_found_with_forms(word: str, page_words: Set[str],
+                            lemma_cache: Dict[str, Set[str]], stem_cache: Dict[str, Optional[str]],
+                            debug_mode: bool = False) -> bool:
+    """Ищет одно нормализованное слово среди слов страницы, допуская другую словоформу:
+    "таблетка" в таблице и "таблетках" на сайте — это одно и то же слово в другом падеже/числе,
+    а не расхождение. Порядок проверки — от дешёвого к дорогому: точное совпадение, затем
+    совпадение по лемме (pymorphy3), затем по основе слова (Stemmer). Кэши общие на все слова
+    одного вызова check_exact_phrases, чтобы не пересчитывать лемму/основу повторно."""
+    if not word:
+        return False
+    if word in page_words:
+        return True
+    if word not in lemma_cache:
+        lemma_cache[word] = cached_lemmatize_word_flexibly(word, debug_mode)
+    word_lemmas = lemma_cache[word]
+    if word_lemmas:
+        for page_word in page_words:
+            if page_word not in lemma_cache:
+                lemma_cache[page_word] = cached_lemmatize_word_flexibly(page_word, debug_mode)
+            if word_lemmas & lemma_cache[page_word]:
+                return True
+    if RUSSIAN_STEMMER:
+        if word not in stem_cache:
+            stem_cache[word] = get_stem_for_word(word)
+        word_stem = stem_cache[word]
+        if word_stem:
+            for page_word in page_words:
+                if page_word not in stem_cache:
+                    stem_cache[page_word] = get_stem_for_word(page_word)
+                if stem_cache[page_word] and word_stem == stem_cache[page_word]:
+                    return True
+    return False
+
 def check_exact_phrases(text: str, phrases_input: Optional[Any], debug_mode: bool = False) -> Dict[str, bool]:
     if not text or not phrases_input or (isinstance(phrases_input, float) and pd.isna(phrases_input)): return {}
     norm_page_text_for_exact_check = normalize_for_search(text)
+    page_words_set = set(norm_page_text_for_exact_check.split())
+    lemma_cache: Dict[str, Set[str]] = {}
+    stem_cache: Dict[str, Optional[str]] = {}
     phrases_list = split_phrases(phrases_input)
     results = {}
     for phrase in phrases_list:
@@ -366,6 +413,16 @@ def check_exact_phrases(text: str, phrases_input: Optional[Any], debug_mode: boo
         found = False
         if norm_phrase_to_find:
             found = norm_phrase_to_find in norm_page_text_for_exact_check
+            if not found:
+                # Точной подстроки нет — но это ещё не ошибка: слова могли поменяться местами
+                # ("как принимать" вместо "принимать как") или стоять в другой словоформе
+                # ("Серрата в таблетках" вместо "серрата таблетка" из таблицы). Считаем фразу
+                # найденной, если для каждого её слова на странице есть слово с тем же
+                # написанием/леммой/основой — независимо от порядка и лишних слов между ними.
+                phrase_words = [w for w in norm_phrase_to_find.split() if w]
+                if phrase_words:
+                    found = all(_word_found_with_forms(w, page_words_set, lemma_cache, stem_cache, debug_mode)
+                                for w in phrase_words)
         if debug_mode:
             if 'debug_messages' not in st.session_state: st.session_state.debug_messages = []
             st.session_state.debug_messages.append({
@@ -741,6 +798,58 @@ def display_debug_messages():
         st.session_state.debug_messages = []
         st.rerun()
 
+def _meta_checker_report_to_excel(df: pd.DataFrame, sheet_name: str,
+                                   status_columns: Optional[List[str]] = None,
+                                   wrap_columns: Optional[List[str]] = None) -> bytes:
+    """Экспорт отчёта SEO Meta Checker в Excel в виде, удобном для просмотра —
+    раньше pandas/xlsxwriter отдавали файл с дефолтной шириной колонок (~8 символов),
+    из-за чего Title/Description/URL выглядели обрезанными "простынями" символов,
+    и без шапки/фильтра длинный список URL было неудобно листать и искать по нему:
+    - шапка закреплена (freeze_panes) и на неё же навешан автофильтр;
+    - ширина колонок подобрана под содержимое (с потолком, чтобы не растягивать
+      Title/Description на весь экран);
+    - в текстовых колонках (Title/Description/Фраза/ошибки) включён перенос строк,
+      чтобы длинный текст был виден целиком, а не обрезан за границей ячейки;
+    - статусные колонки ("Да"/"Нет", "✅"/"❌") подсвечены зелёным/красным, чтобы
+      ошибки было видно с одного взгляда, не читая каждую строку."""
+    output = BytesIO()
+    safe_sheet_name = sheet_name[:31]
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+        if df.empty:
+            return output.getvalue()
+        workbook = writer.book
+        worksheet = writer.sheets[safe_sheet_name]
+
+        header_fmt = workbook.add_format({'bold': True, 'text_wrap': True, 'valign': 'top',
+                                           'bg_color': '#2F5233', 'font_color': '#FFFFFF', 'border': 1})
+        wrap_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+        ok_fmt = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
+        bad_fmt = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+
+        n_rows = len(df)
+        worksheet.freeze_panes(1, 0)
+        worksheet.autofilter(0, 0, n_rows, len(df.columns) - 1)
+
+        wrap_columns = set(wrap_columns or [])
+        for col_idx, col_name in enumerate(df.columns):
+            worksheet.write(0, col_idx, col_name, header_fmt)
+            content_len = df[col_name].astype(str).map(len).max() if n_rows else 0
+            header_len = len(str(col_name))
+            if col_name in wrap_columns:
+                worksheet.set_column(col_idx, col_idx, min(max(header_len, 45), 70), wrap_fmt)
+            else:
+                worksheet.set_column(col_idx, col_idx, min(max(content_len, header_len) + 2, 60))
+
+        for status_col in (status_columns or []):
+            if status_col not in df.columns:
+                continue
+            col_idx = df.columns.get_loc(status_col)
+            for needle, fmt in (('Нет', bad_fmt), ('❌', bad_fmt), ('Да', ok_fmt), ('✅', ok_fmt)):
+                worksheet.conditional_format(1, col_idx, n_rows, col_idx, {
+                    'type': 'text', 'criteria': 'containing', 'value': needle, 'format': fmt})
+    return output.getvalue()
+
 def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                             all_site_data: Dict[str, Dict[str, Dict[str, Any]]],
                             debug_mode: bool):
@@ -836,12 +945,16 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
                 "Description схожесть (%)": '' if is_load_error else item_r.get('desc_similarity', ''),
             })
         meta_report_df = pd.DataFrame(meta_report_rows)
-        meta_report_buffer = BytesIO()
-        with pd.ExcelWriter(meta_report_buffer, engine='xlsxwriter') as meta_report_writer:
-            meta_report_df.to_excel(meta_report_writer, index=False, sheet_name=f'Title_Description_{lang_to_check.upper()}'[:31])
+        meta_report_bytes = _meta_checker_report_to_excel(
+            meta_report_df,
+            sheet_name=f'Title_Description_{lang_to_check.upper()}',
+            status_columns=["Title совпадает", "Description совпадает"],
+            wrap_columns=["Ошибка загрузки", f"Title ({expected_title_col})", "Title на сайте",
+                          f"Description ({expected_desc_col})", "Description на сайте"],
+        )
         st.download_button(
             f"📥 Скачать отчёт Title/Description ({lang_to_check.upper()})",
-            data=meta_report_buffer.getvalue(),
+            data=meta_report_bytes,
             file_name=f"seo_meta_checker_title_description_{lang_to_check}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"dl_meta_report_{lang_to_check}"
@@ -941,8 +1054,21 @@ def run_checks_for_language(lang_to_check: str, df_excel: pd.DataFrame,
             st.dataframe(filtered_df, hide_index=True, use_container_width=True, height=600,
                          column_config={"URL": st.column_config.TextColumn("Проверенный URL", width="medium"),
                                         "Фраза": st.column_config.TextColumn("Фраза", width="large")})
-            csv_dl = filtered_df.to_csv(index=False, encoding='utf-8-sig')
-            st.download_button(f"📥 Скачать результаты ({lang_to_check.upper()})", csv_dl, f'filtered_phrases_{lang_to_check}.csv', 'text/csv', key=f"dl_phr_t2_btn_{lang_to_check}")
+            dl_cols = st.columns(2)
+            with dl_cols[0]:
+                phrases_excel_bytes = _meta_checker_report_to_excel(
+                    filtered_df, sheet_name=f'Фразы_{lang_to_check.upper()}',
+                    status_columns=["Статус"], wrap_columns=["URL", "Фраза"],
+                )
+                st.download_button(f"📥 Скачать результаты — Excel, удобно смотреть ({lang_to_check.upper()})",
+                                    phrases_excel_bytes, f'filtered_phrases_{lang_to_check}.xlsx',
+                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_phr_t2_xlsx_btn_{lang_to_check}")
+            with dl_cols[1]:
+                csv_dl = filtered_df.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(f"📥 Скачать результаты — CSV ({lang_to_check.upper()})", csv_dl,
+                                    f'filtered_phrases_{lang_to_check}.csv', 'text/csv',
+                                    key=f"dl_phr_t2_btn_{lang_to_check}")
         elif skipped_empty_url_count == len(df_excel):
             st.warning("⚠️ Во всех строках файла пустой URL — проверять нечего.")
         else:
@@ -2543,7 +2669,14 @@ def main():
                 df_for_tabs_display = None
 
             if df_for_tabs_display is not None:
-                main_ru_tab, main_ua_tab = st.tabs(["🇷🇺 Русская Версия", "🇺🇦 Украинская Версия"])
+                # Переключатель версии сайта раньше был обычными вкладками сразу после
+                # сводки по загрузке — среди прогресс-баров и метрик его было легко
+                # проскроллить и не заметить. Явный подзаголовок + подсказка над
+                # вкладками делают его заметным, не меняя саму механику переключения.
+                st.markdown("---")
+                st.markdown("### 🌐 Переключатель версии сайта")
+                st.info("👇 Результаты разделены на две вкладки — кликните, чтобы посмотреть нужную версию:")
+                main_ru_tab, main_ua_tab = st.tabs(["🇷🇺 Русская Версия (RU)", "🇺🇦 Украинская Версия (UA)"])
                 with main_ru_tab:
                     run_checks_for_language('ru', df_for_tabs_display, st.session_state.processed_data, debug_mode)
                 with main_ua_tab:
